@@ -36,6 +36,24 @@ const BLOBS_DIR: &str = "blobs";
 const CACHE_DIR: &str = "cache";
 const PROJECT_TOML: &str = "project.toml";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SceneEpochMismatch {
+    pub expected: u64,
+    pub actual: u64,
+}
+
+impl std::fmt::Display for SceneEpochMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "scene epoch mismatch: expected {}, actual {}",
+            self.expected, self.actual
+        )
+    }
+}
+
+impl std::error::Error for SceneEpochMismatch {}
+
 /// Snapshot written to `scene.bin`.
 #[derive(Serialize, Deserialize)]
 struct Snapshot {
@@ -126,6 +144,20 @@ impl ProjectSession {
     /// Apply an Op. Returns the epoch after apply.
     pub fn apply(&self, op: Op) -> Result<u64> {
         let mut history = self.history.lock();
+        let mut scene = self.scene.write();
+        history.apply(&mut scene, op)
+    }
+
+    /// Apply only when the caller's scene snapshot is still current.
+    ///
+    /// The comparison and mutation share the history lock, so this is a real
+    /// compare-and-swap rather than a client-side read/check/write sequence.
+    pub fn apply_if_epoch(&self, expected: u64, op: Op) -> Result<u64> {
+        let mut history = self.history.lock();
+        let actual = history.epoch();
+        if actual != expected {
+            return Err(SceneEpochMismatch { expected, actual }.into());
+        }
         let mut scene = self.scene.write();
         history.apply(&mut scene, op)
     }

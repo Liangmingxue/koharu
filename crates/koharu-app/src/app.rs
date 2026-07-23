@@ -225,6 +225,23 @@ impl App {
         Ok(epoch)
     }
 
+    /// Epoch-conditional scene mutation used by external workflow gateways.
+    pub fn apply_if_epoch(&self, expected_epoch: u64, op: koharu_core::Op) -> Result<u64> {
+        let session = self
+            .current_session()
+            .ok_or_else(|| anyhow::anyhow!("no project open"))?;
+        let epoch = session.apply_if_epoch(expected_epoch, op)?;
+        if let Some(tx) = self
+            .autosave
+            .try_lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|handle| handle.tx.clone()))
+        {
+            let _ = tx.try_send(AutosaveSignal::Dirty);
+        }
+        Ok(epoch)
+    }
+
     pub fn undo(&self) -> Result<Option<u64>> {
         let session = self
             .current_session()

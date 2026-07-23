@@ -23,6 +23,21 @@ async fn apply(app: &TestApp, op: Op) -> anyhow::Result<u64> {
     Ok(v["epoch"].as_u64().expect("epoch in response"))
 }
 
+async fn apply_at_epoch(
+    app: &TestApp,
+    expected_epoch: u64,
+    op: Op,
+) -> anyhow::Result<reqwest::Response> {
+    Ok(app
+        .client_config
+        .client
+        .post(format!("{}/history/apply", app.base_url))
+        .header(reqwest::header::IF_MATCH, format!("\"{expected_epoch}\""))
+        .json(&op)
+        .send()
+        .await?)
+}
+
 async fn undo(app: &TestApp) -> anyhow::Result<Option<u64>> {
     let resp = app
         .client_config
@@ -143,6 +158,36 @@ async fn update_page_then_undo_round_trips() -> anyhow::Result<()> {
         let scene = session.scene.read();
         assert_eq!(scene.page(page_id).unwrap().name, "renamed");
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn conditional_apply_rejects_stale_epoch_without_mutating_scene() -> anyhow::Result<()> {
+    let app = TestApp::spawn().await?;
+    app.open_fresh_project("conditional").await?;
+    let page_ids = import_pages(
+        &app,
+        vec![("page.png", TestApp::tiny_png(10, 10, [0, 0, 0, 255]))],
+    )
+    .await?;
+    let page_id: koharu_core::PageId =
+        page_ids[0].parse::<uuid::Uuid>().map(koharu_core::PageId)?;
+    let current_epoch = app.app.current_session().unwrap().epoch();
+    let op = Op::UpdatePage {
+        id: page_id,
+        patch: PagePatch {
+            name: Some("must-not-apply".into()),
+            width: None,
+            height: None,
+        },
+        prev: Default::default(),
+    };
+
+    let response = apply_at_epoch(&app, current_epoch - 1, op).await?;
+    assert_eq!(response.status(), reqwest::StatusCode::PRECONDITION_FAILED);
+    let session = app.app.current_session().unwrap();
+    assert_eq!(session.epoch(), current_epoch);
+    assert_eq!(session.scene.read().page(page_id).unwrap().name, "page.png");
     Ok(())
 }
 
