@@ -845,7 +845,13 @@ fn layout_source_from_input(block: &RenderBlockInput, translation: &str) -> Rend
         width: block.transform.width.max(1.0),
         height: block.transform.height.max(1.0),
         text: translation.to_string(),
-        source_direction: block.source_direction.map(core_direction_to_renderer),
+        // rendered_direction is an explicit layout override.  OCR-owned
+        // source_direction remains unchanged in the scene and is only the
+        // fallback when no optimizer/planner override is present.
+        source_direction: block
+            .rendered_direction
+            .or(block.source_direction)
+            .map(core_direction_to_renderer),
     }
 }
 
@@ -1263,6 +1269,18 @@ mod tests {
             rendered_direction: None,
             lock_layout_box: false,
         }
+    }
+
+    #[test]
+    fn explicit_rendered_direction_overrides_ocr_direction_without_mutating_it() {
+        let mut input = block(0.0, 0.0, 100.0, 20.0, "收入");
+        input.source_direction = Some(TextDirection::Horizontal);
+        input.rendered_direction = Some(TextDirection::Vertical);
+
+        let layout = layout_source_from_input(&input, &input.translation);
+
+        assert_eq!(writing_mode_for_block(&layout), WritingMode::VerticalRl);
+        assert_eq!(input.source_direction, Some(TextDirection::Horizontal));
     }
 
     fn paint_rect(img: &mut GrayImage, x0: u32, y0: u32, x1: u32, y1: u32, value: u8) {

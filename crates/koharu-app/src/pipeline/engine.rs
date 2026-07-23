@@ -63,6 +63,11 @@ pub struct PipelineRunOptions {
     /// and process just that one block. Other engines ignore it.
     pub region: Option<Region>,
     pub reading_order: Option<ReadingOrder>,
+    /// Deterministic adapter parameters. Current built-in inpainters accept
+    /// only seed=0 and an empty object; the values are still carried so
+    /// external gateways can bind and audit the exact invocation.
+    pub seed: Option<u64>,
+    pub engine_config: Option<serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------------

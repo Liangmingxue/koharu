@@ -14,6 +14,7 @@ use std::sync::atomic::AtomicBool;
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Multipart, Path, Query, State};
+use axum::http::HeaderMap;
 use image::GenericImageView;
 use koharu_app::pipeline::{self, EngineCtx, PipelineRunOptions};
 use koharu_core::{
@@ -26,6 +27,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::AppState;
 use crate::error::{ApiError, ApiResult};
+use crate::routes::history::{map_apply_error, parse_epoch_precondition};
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::IntoParams)]
 #[serde(rename_all = "camelCase")]
@@ -441,6 +443,7 @@ fn scene_contains_page(scene: &Scene, id: PageId) -> bool {
 pub struct PutMaskResponse {
     pub node: NodeId,
     pub blob: BlobRef,
+    pub epoch: u64,
 }
 
 /// Upsert the `Mask { role }` node on a page with the raw image bytes in
@@ -453,15 +456,21 @@ pub struct PutMaskResponse {
     params(
         ("id"   = PageId,   Path, description = "Page id"),
         ("role" = MaskRole, Path, description = "Mask role (segment|brushInpaint)"),
+        ("If-Match" = Option<String>, Header, description = "Quoted or unquoted expected scene epoch"),
         PutMaskParams,
     ),
     request_body(content_type = "image/png"),
-    responses((status = 200, body = PutMaskResponse))
+    responses(
+        (status = 200, body = PutMaskResponse),
+        (status = 412, description = "Scene epoch differs from If-Match"),
+        (status = 400, description = "Malformed If-Match epoch")
+    )
 )]
 async fn put_mask(
     State(app): State<AppState>,
     Path((page_id, role)): Path<(PageId, MaskRole)>,
     Query(params): Query<PutMaskParams>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Json<PutMaskResponse>> {
     let session = app
@@ -528,7 +537,7 @@ async fn put_mask(
         }
     };
 
-    if let Some(engine_id) = params.pipeline.as_ref() {
+    let op = if let Some(engine_id) = params.pipeline.as_ref() {
         // Atomic Batch: Mask Update + Pipeline Run
         let mut ops = vec![mask_op.clone()];
 
@@ -581,14 +590,20 @@ async fn put_mask(
             ops,
             label: format!("Repair Brush ({})", engine_id),
         };
-        app.apply(batch).map_err(ApiError::internal)?;
+        batch
     } else {
-        app.apply(mask_op).map_err(ApiError::internal)?;
-    }
+        mask_op
+    };
+    let expected = parse_epoch_precondition(&headers)?;
+    let epoch = match expected {
+        Some(expected) => app.apply_if_epoch(expected, op).map_err(map_apply_error)?,
+        None => app.apply(op).map_err(ApiError::internal)?,
+    };
 
     Ok(Json(PutMaskResponse {
         node: node_id,
         blob,
+        epoch,
     }))
 }
 

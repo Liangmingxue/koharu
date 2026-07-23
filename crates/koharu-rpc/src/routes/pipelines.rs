@@ -50,6 +50,10 @@ pub struct StartPipelineRequest {
     pub default_font: Option<String>,
     #[serde(default)]
     pub reading_order: Option<ReadingOrder>,
+    #[serde(default)]
+    pub seed: Option<u64>,
+    #[serde(default)]
+    pub engine_config: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -75,6 +79,24 @@ async fn start_pipeline(
     for id in &req.steps {
         pipeline::Registry::find(id).map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     }
+    if req.seed.unwrap_or(0) != 0 {
+        return Err(ApiError::bad_request(
+            "current deterministic pipeline adapter only supports seed=0",
+        ));
+    }
+    if req
+        .engine_config
+        .as_ref()
+        .map(|value| match value.as_object() {
+            Some(object) => !object.is_empty(),
+            None => true,
+        })
+        .unwrap_or(false)
+    {
+        return Err(ApiError::bad_request(
+            "current deterministic pipeline adapter only supports an empty engineConfig",
+        ));
+    }
     let spec = PipelineSpec {
         scope: match req.pages {
             Some(pages) => Scope::Pages(pages),
@@ -88,6 +110,8 @@ async fn start_pipeline(
             text_node_ids: req.text_node_ids,
             region: req.region,
             reading_order: req.reading_order,
+            seed: req.seed,
+            engine_config: req.engine_config,
         },
     };
 

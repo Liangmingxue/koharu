@@ -88,7 +88,7 @@ async fn apply_command(
     Ok(Json(HistoryResult { epoch: Some(epoch) }))
 }
 
-fn parse_epoch_precondition(headers: &HeaderMap) -> ApiResult<Option<u64>> {
+pub(crate) fn parse_epoch_precondition(headers: &HeaderMap) -> ApiResult<Option<u64>> {
     let Some(value) = headers.get(axum::http::header::IF_MATCH) else {
         return Ok(None);
     };
@@ -123,7 +123,7 @@ fn parse_epoch_precondition(headers: &HeaderMap) -> ApiResult<Option<u64>> {
         .map_err(|_| ApiError::bad_request("If-Match scene epoch is not an unsigned integer"))
 }
 
-fn map_apply_error(error: anyhow::Error) -> ApiError {
+pub(crate) fn map_apply_error(error: anyhow::Error) -> ApiError {
     if let Some(mismatch) = error.downcast_ref::<SceneEpochMismatch>() {
         return ApiError::new(StatusCode::PRECONDITION_FAILED, mismatch.to_string());
     }
