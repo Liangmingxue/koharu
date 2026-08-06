@@ -25,16 +25,21 @@ Do not reintroduce the former Text Perception/Actor/Executor Agent design.
 Koharu operations are deterministic Gateway capabilities, not additional
 Agents or LangGraph nodes.
 
-## Verified baseline (2026-08-03)
+## Verified baseline (2026-08-06)
 
-- Branch `main` is two commits ahead of `origin/main`.
+- The committed Gateway baseline is
+  `9512a821 feat(gateway): persist immutable OCR source geometry`.
 - The worktree also contains intentional, uncommitted Gateway, OCR, inpaint,
   renderer, reopen, scene-epoch, and HTTP-idempotency changes. Preserve them.
 - Committed extensions include conditional scene-epoch writes and conditional
-  mask/direction capabilities.
-- The current worktree preserves PaddleOCR-VL quadrilateral/line polygons and
-  source direction, scopes inpaint masks to selected text nodes, preserves
+  mask/direction capabilities plus immutable PaddleOCR-VL block/line geometry,
+  source direction/rotation, and detector evidence.
+- The current worktree scopes inpaint masks to selected text nodes, preserves
   explicit text style, and persists idempotency receipts on the server.
+- Adjacent Chart Agent commit `983648c` adds the deterministic PNG/JPEG
+  structure profiler, `structure-manifest.v2`, structure-aware initial edit
+  masks, and the active `execution-manifest.v4` chain. Its cold-start gate
+  loads 42 Schemas and all 140 Python tests pass.
 - Verified locally: 56 `koharu-app`, 51 `koharu-renderer`, and 5 `koharu-rpc`
   library tests pass; the 7 `RenderControlsPanel` tests pass.
 
