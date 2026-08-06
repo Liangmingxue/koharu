@@ -33,3 +33,26 @@ fn openapi_paths_snapshot() {
 
     insta::assert_debug_snapshot!(paths);
 }
+
+#[test]
+fn source_geometry_is_public_but_not_patchable() {
+    let (_, spec) = koharu_rpc::api::api();
+    let json = serde_json::to_value(&spec).expect("serialize OpenAPI");
+    let schemas = json["components"]["schemas"]
+        .as_object()
+        .expect("schema object");
+    assert!(schemas.contains_key("SourceGeometryEvidence"));
+    assert!(schemas.contains_key("DetectorEvidence"));
+    assert!(
+        schemas["TextData"]["properties"]
+            .as_object()
+            .unwrap()
+            .contains_key("sourceGeometry")
+    );
+    assert!(
+        !schemas["TextDataPatch"]["properties"]
+            .as_object()
+            .unwrap()
+            .contains_key("sourceGeometry")
+    );
+}

@@ -62,7 +62,7 @@ impl Engine for Model {
                     translation: translation.to_string(),
                     style: t.style.clone(),
                     font_prediction: t.font_prediction.clone(),
-                    source_direction: t.source_direction,
+                    source_direction: t.recorded_source_direction(),
                     rendered_direction: t.rendered_direction,
                     lock_layout_box: t.lock_layout_box,
                 })

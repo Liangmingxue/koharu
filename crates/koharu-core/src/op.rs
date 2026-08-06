@@ -55,6 +55,10 @@ pub enum OpError {
         patch: NodeKindTag,
         existing: NodeKindTag,
     },
+    #[error("immutable source geometry evidence cannot be patched")]
+    ImmutableSourceGeometry,
+    #[error("invalid source geometry evidence: {0}")]
+    InvalidSourceGeometry(String),
     #[error("scene invariant violated: {0}")]
     Invariant(&'static str),
 }
@@ -338,6 +342,7 @@ impl Op {
                 if *at > len {
                     return Err(OpError::IndexOutOfRange { index: *at, len });
                 }
+                validate_node_source_geometry(page_ref, node)?;
                 page_ref.nodes.insert(node.id, node.clone());
                 let last = page_ref.nodes.len() - 1;
                 if *at < last {
@@ -389,6 +394,14 @@ impl Op {
                             patch: data_patch.tag(),
                             existing,
                         });
+                    }
+                    if matches!(
+                        (&node.kind, data_patch),
+                        (NodeKind::Text(text), NodeDataPatch::Text(text_patch))
+                            if text.source_geometry.is_some()
+                                && text_patch.modifies_legacy_source_geometry()
+                    ) {
+                        return Err(OpError::ImmutableSourceGeometry);
                     }
                 }
                 *prev = capture_prev_node_patch(node, patch);
@@ -522,6 +535,7 @@ impl Op {
                         len: page_ref.nodes.len(),
                     });
                 }
+                validate_node_source_geometry(page_ref, node)?;
                 Ok(())
             }
             Op::RemoveNode { page, id, .. } => {
@@ -549,6 +563,14 @@ impl Op {
                             existing,
                         });
                     }
+                    if matches!(
+                        (&node.kind, data_patch),
+                        (NodeKind::Text(text), NodeDataPatch::Text(text_patch))
+                            if text.source_geometry.is_some()
+                                && text_patch.modifies_legacy_source_geometry()
+                    ) {
+                        return Err(OpError::ImmutableSourceGeometry);
+                    }
                 }
                 Ok(())
             }
@@ -568,6 +590,28 @@ impl Op {
 
 // ---------------------------------------------------------------------------
 // Helpers
+
+impl TextDataPatch {
+    fn modifies_legacy_source_geometry(&self) -> bool {
+        self.confidence.is_some()
+            || self.source_direction.is_some()
+            || self.line_polygons.is_some()
+            || self.rotation_deg.is_some()
+            || self.detector.is_some()
+    }
+}
+
+fn validate_node_source_geometry(page: &Page, node: &Node) -> OpResult {
+    let NodeKind::Text(text) = &node.kind else {
+        return Ok(());
+    };
+    let Some(geometry) = &text.source_geometry else {
+        return Ok(());
+    };
+    geometry
+        .validate(page.width, page.height)
+        .map_err(OpError::InvalidSourceGeometry)
+}
 // ---------------------------------------------------------------------------
 
 fn ensure_same_page_set(pages: &indexmap::IndexMap<PageId, Page>, order: &[PageId]) -> OpResult {
@@ -819,7 +863,10 @@ fn apply_mask_patch(m: &mut MaskData, p: &MaskDataPatch) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scene::{ImageData, ImageRole, Node, NodeKind, Page};
+    use crate::scene::{
+        DetectorEvidence, ImageData, ImageRole, LineDetectorEvidence, Node, NodeKind, Page,
+        SOURCE_GEOMETRY_EVIDENCE_VERSION, SourceGeometryEvidence,
+    };
 
     fn seed_scene() -> Scene {
         Scene::default()
@@ -841,6 +888,49 @@ mod tests {
                 natural_width: 100,
                 natural_height: 100,
                 name: Some("layer.png".into()),
+            }),
+        }
+    }
+
+    fn source_text_node() -> Node {
+        let polygon = [[10.0, 20.0], [90.0, 24.0], [88.0, 50.0], [8.0, 46.0]];
+        Node {
+            id: NodeId::new(),
+            transform: Transform {
+                x: 8.0,
+                y: 20.0,
+                width: 82.0,
+                height: 30.0,
+                rotation_deg: 2.86,
+            },
+            visible: true,
+            kind: NodeKind::Text(TextData {
+                source_direction: Some(TextDirection::Horizontal),
+                line_polygons: Some(vec![polygon]),
+                rotation_deg: Some(2.86),
+                detector: Some("fixture-detector".into()),
+                text: Some("source".into()),
+                source_geometry: Some(SourceGeometryEvidence {
+                    schema_version: SOURCE_GEOMETRY_EVIDENCE_VERSION.into(),
+                    block_polygon: polygon,
+                    line_polygons: vec![polygon],
+                    source_direction: TextDirection::Horizontal,
+                    source_direction_source: "fixture.direction.v1".into(),
+                    source_rotation_deg: 2.86,
+                    detector_evidence: DetectorEvidence {
+                        detector_id: "fixture-detector".into(),
+                        detector_version: "fixture-detector.v1".into(),
+                        config_hash: format!("sha256:{}", "0".repeat(64)),
+                        block_polygon_confidence: None,
+                        line_evidence: vec![LineDetectorEvidence {
+                            text_confidence: Some(0.9),
+                            polygon_confidence: None,
+                        }],
+                        direction_confidence: None,
+                        rotation_confidence: None,
+                    },
+                }),
+                ..Default::default()
             }),
         }
     }
@@ -902,6 +992,85 @@ mod tests {
         let mut undo = op.inverse();
         undo.apply(&mut scene).unwrap();
         assert_eq!(scene.node(page_id, node_id).unwrap().transform.x, 0.0);
+    }
+
+    #[test]
+    fn immutable_source_geometry_rejects_legacy_source_patch() {
+        let mut scene = seed_scene();
+        let page = blank_page();
+        let page_id = page.id;
+        Op::AddPage { page, at: 0 }.apply(&mut scene).unwrap();
+        let node = source_text_node();
+        let node_id = node.id;
+        Op::AddNode {
+            page: page_id,
+            node,
+            at: 0,
+        }
+        .apply(&mut scene)
+        .unwrap();
+
+        let mut translation = Op::UpdateNode {
+            page: page_id,
+            id: node_id,
+            patch: NodePatch {
+                data: Some(NodeDataPatch::Text(TextDataPatch {
+                    translation: Some(Some("target".into())),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            prev: NodePatch::default(),
+        };
+        translation.apply(&mut scene).unwrap();
+
+        let mut source_patch = Op::UpdateNode {
+            page: page_id,
+            id: node_id,
+            patch: NodePatch {
+                data: Some(NodeDataPatch::Text(TextDataPatch {
+                    rotation_deg: Some(Some(45.0)),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            prev: NodePatch::default(),
+        };
+        assert!(matches!(
+            source_patch.apply(&mut scene),
+            Err(OpError::ImmutableSourceGeometry)
+        ));
+        let NodeKind::Text(text) = &scene.node(page_id, node_id).unwrap().kind else {
+            panic!("expected text node");
+        };
+        assert_eq!(text.translation.as_deref(), Some("target"));
+        assert_eq!(
+            text.source_geometry.as_ref().unwrap().source_rotation_deg,
+            2.86
+        );
+    }
+
+    #[test]
+    fn add_node_rejects_invalid_source_geometry() {
+        let mut scene = seed_scene();
+        let page = blank_page();
+        let page_id = page.id;
+        Op::AddPage { page, at: 0 }.apply(&mut scene).unwrap();
+        let mut node = source_text_node();
+        let NodeKind::Text(text) = &mut node.kind else {
+            unreachable!();
+        };
+        text.source_geometry.as_mut().unwrap().block_polygon =
+            [[10.0, 10.0], [90.0, 90.0], [10.0, 90.0], [90.0, 10.0]];
+
+        let result = Op::AddNode {
+            page: page_id,
+            node,
+            at: 0,
+        }
+        .apply(&mut scene);
+        assert!(matches!(result, Err(OpError::InvalidSourceGeometry(_))));
+        assert!(scene.page(page_id).unwrap().nodes.is_empty());
     }
 
     #[test]

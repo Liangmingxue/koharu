@@ -67,6 +67,13 @@ pub struct TextData {
     )]
     pub source_direction: Option<Option<models::TextDirection>>,
     #[serde(
+        rename = "sourceGeometry",
+        default,
+        with = "::serde_with::rust::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub source_geometry: Option<Option<Box<models::SourceGeometryEvidence>>>,
+    #[serde(
         rename = "sourceLang",
         default,
         with = "::serde_with::rust::double_option",
@@ -124,6 +131,7 @@ impl TextData {
             rendered_direction: None,
             rotation_deg: None,
             source_direction: None,
+            source_geometry: None,
             source_lang: None,
             sprite: None,
             sprite_transform: None,

@@ -16,6 +16,7 @@ pub mod llm_translate;
 pub mod manga_ocr;
 pub mod mit48px_ocr;
 pub mod paddle_ocr;
+pub mod paddleocr_vl_api;
 pub mod pp_doclayout;
 pub mod renderer;
 pub mod support;

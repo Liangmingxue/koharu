@@ -5,7 +5,12 @@
 //! serialized as JSON — end-to-end round trip through axum's JSON extractor
 //! exercises exactly the wire format the frontend will use.
 
-use koharu_core::{ImageRole, NodeKind, Op, PagePatch};
+use koharu_client::apis::default_api as api;
+use koharu_client::models;
+use koharu_core::{
+    DetectorEvidence, ImageRole, LineDetectorEvidence, Node, NodeId, NodeKind, Op, PagePatch,
+    SOURCE_GEOMETRY_EVIDENCE_VERSION, SourceGeometryEvidence, TextData, TextDirection, Transform,
+};
 use koharu_integration_tests::TestApp;
 use reqwest::multipart::{Form, Part};
 use serde_json::Value;
@@ -113,6 +118,133 @@ async fn import_pages_creates_source_nodes() -> anyhow::Result<()> {
         assert_eq!(sources, 1);
     }
     Ok(())
+}
+
+#[tokio::test]
+async fn multiline_source_geometry_round_trips_through_http_and_reopen() -> anyhow::Result<()> {
+    let app = TestApp::spawn().await?;
+    let project = api::create_project(
+        &app.client_config,
+        models::CreateProjectRequest {
+            name: "Geometry Roundtrip".into(),
+        },
+    )
+    .await?;
+    let page_ids = import_pages(
+        &app,
+        vec![(
+            "geometry.png",
+            TestApp::tiny_png(160, 100, [255, 255, 255, 255]),
+        )],
+    )
+    .await?;
+    let page_id = page_ids[0].parse::<uuid::Uuid>().map(koharu_core::PageId)?;
+    let node_id = NodeId::new();
+    let line_one = [[10.0, 20.0], [140.0, 24.0], [139.0, 40.0], [9.0, 36.0]];
+    let line_two = [[12.0, 50.0], [130.0, 54.0], [129.0, 70.0], [11.0, 66.0]];
+    let geometry = SourceGeometryEvidence {
+        schema_version: SOURCE_GEOMETRY_EVIDENCE_VERSION.into(),
+        block_polygon: [[9.0, 20.0], [140.0, 24.0], [129.0, 70.0], [11.0, 66.0]],
+        line_polygons: vec![line_one, line_two],
+        source_direction: TextDirection::Horizontal,
+        source_direction_source: "fixture.direction.v1".into(),
+        source_rotation_deg: 1.76,
+        detector_evidence: DetectorEvidence {
+            detector_id: "fixture-detector".into(),
+            detector_version: "fixture-detector.v1".into(),
+            config_hash: format!("sha256:{}", "b".repeat(64)),
+            block_polygon_confidence: Some(0.88),
+            line_evidence: vec![
+                LineDetectorEvidence {
+                    text_confidence: Some(0.95),
+                    polygon_confidence: Some(0.9),
+                },
+                LineDetectorEvidence {
+                    text_confidence: Some(0.93),
+                    polygon_confidence: Some(0.89),
+                },
+            ],
+            direction_confidence: Some(0.8),
+            rotation_confidence: None,
+        },
+    };
+    apply(
+        &app,
+        Op::AddNode {
+            page: page_id,
+            node: Node {
+                id: node_id,
+                transform: Transform {
+                    x: 9.0,
+                    y: 20.0,
+                    width: 131.0,
+                    height: 50.0,
+                    rotation_deg: 1.76,
+                },
+                visible: true,
+                kind: NodeKind::Text(TextData {
+                    text: Some("line one\nline two".into()),
+                    source_geometry: Some(geometry.clone()),
+                    ..Default::default()
+                }),
+            },
+            at: 1,
+        },
+    )
+    .await?;
+
+    let before = scene_geometry_json(&app, page_id, node_id).await?;
+    assert_eq!(before["linePolygons"].as_array().unwrap().len(), 2);
+
+    let binary = app
+        .client_config
+        .client
+        .get(format!("{}/scene.bin", app.base_url))
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+    #[derive(serde::Deserialize)]
+    struct WireSnapshot {
+        epoch: u64,
+        scene: koharu_core::Scene,
+    }
+    let snapshot: WireSnapshot = postcard::from_bytes(&binary)?;
+    assert!(snapshot.epoch > 0);
+    let NodeKind::Text(text) = &snapshot.scene.node(page_id, node_id).unwrap().kind else {
+        panic!("expected text node");
+    };
+    assert_eq!(text.source_geometry.as_ref(), Some(&geometry));
+
+    api::delete_current_project(&app.client_config).await?;
+    api::put_current_project(
+        &app.client_config,
+        models::OpenProjectRequest { id: project.id },
+    )
+    .await?;
+    let reopened = scene_geometry_json(&app, page_id, node_id).await?;
+    assert_eq!(reopened, before);
+    Ok(())
+}
+
+async fn scene_geometry_json(
+    app: &TestApp,
+    page_id: koharu_core::PageId,
+    node_id: NodeId,
+) -> anyhow::Result<Value> {
+    let snapshot: Value = app
+        .client_config
+        .client
+        .get(format!("{}/scene.json", app.base_url))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(snapshot["scene"]["pages"][page_id.to_string()]["nodes"][node_id.to_string()]["kind"]
+        ["text"]["sourceGeometry"]
+        .clone())
 }
 
 #[tokio::test]

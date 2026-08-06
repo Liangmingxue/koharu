@@ -119,6 +119,9 @@ impl TestApp {
             base_path: base_url.clone(),
             user_agent: Some("koharu-integration-tests".to_string()),
             client: reqwest::Client::builder()
+                // The harness always talks to its own loopback listener; a
+                // developer's HTTP proxy must not intercept acceptance tests.
+                .no_proxy()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()?,
             ..Default::default()

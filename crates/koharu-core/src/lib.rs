@@ -34,7 +34,8 @@ pub use protocol::{
     PipelineConfigPatch, PipelineLlmRequest, ProviderPatch, ReadingOrder, Region,
 };
 pub use scene::{
-    ImageData, ImageRole, MaskData, MaskRole, Node, NodeId, NodeKind, NodeKindTag, Page, PageId,
-    ProjectMeta, ProjectStyle, Scene, TextData, Transform,
+    DetectorEvidence, ImageData, ImageRole, LineDetectorEvidence, MaskData, MaskRole, Node, NodeId,
+    NodeKind, NodeKindTag, Page, PageId, ProjectMeta, ProjectStyle,
+    SOURCE_GEOMETRY_EVIDENCE_VERSION, Scene, SourceGeometryEvidence, TextData, Transform,
 };
 pub use style::{TextAlign, TextShaderEffect, TextStrokeStyle, TextStyle};

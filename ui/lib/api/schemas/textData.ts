@@ -5,6 +5,7 @@
  */
 import type { BlobRef } from './blobRef'
 import type { FontPrediction } from './fontPrediction'
+import type { SourceGeometryEvidence } from './sourceGeometryEvidence'
 import type { TextDirection } from './textDirection'
 import type { TextStyle } from './textStyle'
 import type { Transform } from './transform'
@@ -23,6 +24,7 @@ export interface TextData {
   /** @nullable */
   rotationDeg?: number | null
   sourceDirection?: null | TextDirection
+  sourceGeometry?: null | SourceGeometryEvidence
   /** @nullable */
   sourceLang?: string | null
   sprite?: null | BlobRef

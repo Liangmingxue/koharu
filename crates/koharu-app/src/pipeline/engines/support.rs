@@ -81,11 +81,13 @@ pub fn text_node_to_region(transform: &Transform, text: &TextData) -> koharu_ml:
         width: transform.width,
         height: transform.height,
         confidence: text.confidence,
-        line_polygons: text.line_polygons.clone(),
-        source_direction: text.source_direction.map(core_text_direction_to_ml),
-        rotation_deg: text.rotation_deg,
+        line_polygons: text.source_line_polygons().map(ToOwned::to_owned),
+        source_direction: text
+            .recorded_source_direction()
+            .map(core_text_direction_to_ml),
+        rotation_deg: text.recorded_source_rotation_deg(),
         detected_font_size_px: text.detected_font_size_px,
-        detector: text.detector.clone(),
+        detector: text.recorded_detector_id().map(ToOwned::to_owned),
     }
 }
 
@@ -233,7 +235,7 @@ pub fn new_text_node(bbox: [f32; 4], text_data: TextData) -> Node {
             y: bbox[1],
             width: bbox[2] - bbox[0],
             height: bbox[3] - bbox[1],
-            rotation_deg: text_data.rotation_deg.unwrap_or(0.0),
+            rotation_deg: text_data.recorded_source_rotation_deg().unwrap_or(0.0),
         },
         visible: true,
         kind: NodeKind::Text(text_data),

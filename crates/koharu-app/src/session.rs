@@ -261,7 +261,9 @@ mod tests {
     use super::*;
     use camino::Utf8PathBuf;
     use koharu_core::{
-        Node, NodeId, NodeKind, Op, Page, PageId, TextData, TextShaderEffect, TextStyle, Transform,
+        DetectorEvidence, LineDetectorEvidence, Node, NodeId, NodeKind, Op, Page, PageId,
+        SOURCE_GEOMETRY_EVIDENCE_VERSION, SourceGeometryEvidence, TextData, TextDirection,
+        TextShaderEffect, TextStyle, Transform,
     };
     use tempfile::tempdir;
 
@@ -352,6 +354,96 @@ mod tests {
             .expect("effect");
         assert!(effect.italic);
         assert!(effect.bold);
+    }
+
+    #[test]
+    fn history_and_snapshot_reopen_preserve_multiline_source_geometry() {
+        let (_tmp, path) = tmp_dir();
+        let page_id: PageId;
+        let node_id = NodeId::new();
+        let line_one = [[10.0, 20.0], [110.0, 24.0], [108.0, 42.0], [8.0, 38.0]];
+        let line_two = [[12.0, 48.0], [102.0, 52.0], [100.0, 70.0], [10.0, 66.0]];
+        let block = [[8.0, 20.0], [110.0, 24.0], [100.0, 70.0], [10.0, 66.0]];
+        let geometry = SourceGeometryEvidence {
+            schema_version: SOURCE_GEOMETRY_EVIDENCE_VERSION.into(),
+            block_polygon: block,
+            line_polygons: vec![line_one, line_two],
+            source_direction: TextDirection::Horizontal,
+            source_direction_source: "fixture.direction.v1".into(),
+            source_rotation_deg: 2.29,
+            detector_evidence: DetectorEvidence {
+                detector_id: "fixture-detector".into(),
+                detector_version: "fixture-detector.v1".into(),
+                config_hash: format!("sha256:{}", "a".repeat(64)),
+                block_polygon_confidence: Some(0.8),
+                line_evidence: vec![
+                    LineDetectorEvidence {
+                        text_confidence: Some(0.91),
+                        polygon_confidence: Some(0.82),
+                    },
+                    LineDetectorEvidence {
+                        text_confidence: Some(0.89),
+                        polygon_confidence: Some(0.8),
+                    },
+                ],
+                direction_confidence: Some(0.75),
+                rotation_confidence: None,
+            },
+        };
+
+        {
+            let session = ProjectSession::create(&path, "geometry").unwrap();
+            let page = Page::new("p1", 800, 600);
+            page_id = page.id;
+            session.apply(Op::AddPage { page, at: 0 }).unwrap();
+            session.compact().unwrap();
+            session
+                .apply(Op::AddNode {
+                    page: page_id,
+                    node: Node {
+                        id: node_id,
+                        transform: Transform {
+                            x: 8.0,
+                            y: 20.0,
+                            width: 102.0,
+                            height: 50.0,
+                            rotation_deg: 2.29,
+                        },
+                        visible: true,
+                        kind: NodeKind::Text(TextData {
+                            text: Some("line one\nline two".into()),
+                            source_geometry: Some(geometry.clone()),
+                            ..Default::default()
+                        }),
+                    },
+                    at: 0,
+                })
+                .unwrap();
+            // Drop without compacting so the first reopen must replay history.
+        }
+
+        {
+            let session = ProjectSession::open(&path).unwrap();
+            assert_source_geometry(&session, page_id, node_id, &geometry);
+            session.compact().unwrap();
+        }
+
+        let session = ProjectSession::open(&path).unwrap();
+        assert_source_geometry(&session, page_id, node_id, &geometry);
+    }
+
+    fn assert_source_geometry(
+        session: &ProjectSession,
+        page_id: PageId,
+        node_id: NodeId,
+        expected: &SourceGeometryEvidence,
+    ) {
+        let scene = session.scene.read();
+        let node = scene.node(page_id, node_id).expect("text node");
+        let NodeKind::Text(text) = &node.kind else {
+            panic!("expected text node");
+        };
+        assert_eq!(text.source_geometry.as_ref(), Some(expected));
     }
 
     #[test]

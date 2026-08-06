@@ -3038,6 +3038,101 @@
           }
         }
       },
+      "DetectorEvidence": {
+        "type": "object",
+        "description": "Detector identity and the confidence channels that produced source\ngeometry.  Missing upstream evidence is represented by `None`, never by a\nfabricated zero.",
+        "required": ["detectorId", "detectorVersion", "configHash"],
+        "properties": {
+          "blockPolygonConfidence": {
+            "type": ["number", "null"],
+            "format": "float"
+          },
+          "configHash": {
+            "type": "string",
+            "description": "Canonical SHA-256 of the detector configuration, including endpoint\nidentity but excluding the image payload."
+          },
+          "detectorId": {
+            "type": "string"
+          },
+          "detectorVersion": {
+            "type": "string"
+          },
+          "directionConfidence": {
+            "type": ["number", "null"],
+            "format": "float"
+          },
+          "lineEvidence": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LineDetectorEvidence"
+            }
+          },
+          "rotationConfidence": {
+            "type": ["number", "null"],
+            "format": "float"
+          }
+        }
+      },
+      "LineDetectorEvidence": {
+        "type": "object",
+        "description": "Confidence attached to one line polygon.  Text recognition confidence and\npolygon confidence are intentionally separate: many OCR services expose\nonly the former.",
+        "properties": {
+          "polygonConfidence": {
+            "type": ["number", "null"],
+            "format": "float"
+          },
+          "textConfidence": {
+            "type": ["number", "null"],
+            "format": "float"
+          }
+        }
+      },
+      "SourceGeometryEvidence": {
+        "type": "object",
+        "description": "Immutable OCR geometry as recorded when a text node is created.\n\nTarget layout remains on [`Transform`] and `rendered_direction`; neither\ntranslation nor rendering may rewrite this evidence.",
+        "required": ["schemaVersion", "blockPolygon", "linePolygons", "sourceDirection", "sourceDirectionSource", "sourceRotationDeg", "detectorEvidence"],
+        "properties": {
+          "blockPolygon": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "number",
+                "format": "float"
+              }
+            }
+          },
+          "detectorEvidence": {
+            "$ref": "#/components/schemas/DetectorEvidence"
+          },
+          "linePolygons": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "array",
+                "items": {
+                  "type": "number",
+                  "format": "float"
+                }
+              }
+            }
+          },
+          "schemaVersion": {
+            "type": "string"
+          },
+          "sourceDirection": {
+            "$ref": "#/components/schemas/TextDirection"
+          },
+          "sourceDirectionSource": {
+            "type": "string"
+          },
+          "sourceRotationDeg": {
+            "type": "number",
+            "format": "float"
+          }
+        }
+      },
       "TextAlign": {
         "type": "string",
         "enum": ["left", "center", "right"]
@@ -3103,6 +3198,17 @@
               },
               {
                 "$ref": "#/components/schemas/TextDirection"
+              }
+            ]
+          },
+          "sourceGeometry": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SourceGeometryEvidence",
+                "description": "Authoritative, immutable source evidence.  Kept at the end of the\npostcard struct so existing project snapshots remain readable."
               }
             ]
           },
