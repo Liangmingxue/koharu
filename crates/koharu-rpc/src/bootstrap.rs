@@ -7,10 +7,13 @@ use koharu_app::{App, AppSharedState};
 use koharu_core::{AppEvent, DownloadProgress, JobSummary};
 use koharu_runtime::RuntimeManager;
 
+use crate::idempotency::IdempotencyStore;
+
 pub struct BootstrapManager {
     app: OnceLock<Arc<App>>,
     runtime: Arc<RuntimeManager>,
     shared: AppSharedState,
+    idempotency: IdempotencyStore,
 }
 
 impl BootstrapManager {
@@ -19,6 +22,7 @@ impl BootstrapManager {
             app: OnceLock::new(),
             runtime,
             shared: AppSharedState::default(),
+            idempotency: IdempotencyStore::default(),
         })
     }
 
@@ -40,6 +44,10 @@ impl BootstrapManager {
 
     pub fn shared_state(&self) -> AppSharedState {
         self.shared.clone()
+    }
+
+    pub fn idempotency(&self) -> &IdempotencyStore {
+        &self.idempotency
     }
 
     pub fn jobs(&self) -> Arc<DashMap<String, JobSummary>> {

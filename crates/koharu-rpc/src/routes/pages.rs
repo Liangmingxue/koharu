@@ -27,6 +27,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::AppState;
 use crate::error::{ApiError, ApiResult};
+use crate::idempotency::{complete_json, replay_json, request_hash};
 use crate::routes::history::{map_apply_error, parse_epoch_precondition};
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::IntoParams)]
@@ -68,6 +69,7 @@ pub struct CreatePagesResponse {
 )]
 async fn create_pages(
     State(app): State<AppState>,
+    headers: HeaderMap,
     mut multipart: Multipart,
 ) -> ApiResult<Json<CreatePagesResponse>> {
     let session = app
@@ -103,6 +105,32 @@ async fn create_pages(
     }
 
     files.sort_by(|a, b| natord::compare(&a.0, &b.0));
+    for (filename, bytes) in &files {
+        image::load_from_memory(bytes)
+            .map_err(|error| ApiError::bad_request(format!("decode `{filename}`: {error}")))?;
+    }
+    let file_bindings: Vec<_> = files
+        .iter()
+        .map(|(filename, bytes)| {
+            (
+                filename.clone(),
+                format!("blake3:{}", blake3::hash(bytes).to_hex()),
+            )
+        })
+        .collect();
+    let config = (**app.config.load()).clone();
+    let decision = app.idempotency().begin(
+        &config.data.path,
+        &headers,
+        "POST /pages",
+        request_hash(
+            "POST /pages",
+            &(session.dir.as_str(), replace, file_bindings),
+        )?,
+    )?;
+    if let Some(response) = replay_json::<CreatePagesResponse>(&decision)? {
+        return Ok(Json(response));
+    }
 
     // Optionally clear the project first. Emitted as a batch so it's one undo step.
     let starting_index = if replace {
@@ -195,7 +223,9 @@ async fn create_pages(
     })
     .map_err(ApiError::internal)?;
 
-    Ok(Json(CreatePagesResponse { pages: created_ids }))
+    let response = CreatePagesResponse { pages: created_ids };
+    complete_json(app.idempotency(), decision, &response)?;
+    Ok(Json(response))
 }
 
 // ---------------------------------------------------------------------------
@@ -482,6 +512,28 @@ async fn put_mask(
     // Validate it actually decodes so we don't persist garbage.
     image::load_from_memory(&body)
         .map_err(|e| ApiError::bad_request(format!("decode mask: {e}")))?;
+    let expected = parse_epoch_precondition(&headers)?;
+    let config = (**app.config.load()).clone();
+    let body_hash = format!("blake3:{}", blake3::hash(&body).to_hex());
+    let decision = app.idempotency().begin(
+        &config.data.path,
+        &headers,
+        "PUT /pages/{id}/masks/{role}",
+        request_hash(
+            "PUT /pages/{id}/masks/{role}",
+            &(
+                session.dir.as_str(),
+                &page_id,
+                &role,
+                &params,
+                expected,
+                body_hash,
+            ),
+        )?,
+    )?;
+    if let Some(response) = replay_json::<PutMaskResponse>(&decision)? {
+        return Ok(Json(response));
+    }
 
     let blob = session.blobs.put_bytes(&body).map_err(ApiError::internal)?;
 
@@ -594,17 +646,18 @@ async fn put_mask(
     } else {
         mask_op
     };
-    let expected = parse_epoch_precondition(&headers)?;
     let epoch = match expected {
         Some(expected) => app.apply_if_epoch(expected, op).map_err(map_apply_error)?,
         None => app.apply(op).map_err(ApiError::internal)?,
     };
 
-    Ok(Json(PutMaskResponse {
+    let response = PutMaskResponse {
         node: node_id,
         blob,
         epoch,
-    }))
+    };
+    complete_json(app.idempotency(), decision, &response)?;
+    Ok(Json(response))
 }
 
 // ---------------------------------------------------------------------------
