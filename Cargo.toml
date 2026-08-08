@@ -127,7 +127,7 @@ hypher = "0.1.7"
 icu_properties = "2.2"
 icu_segmenter = "2.2"
 jieba-rs = "0.10"
-fontdb = "0.23"
+fontdb = "0.24"
 fontdue = "0.9"
 tiny-skia = "0.12"
 axum = { version = "0.8", features = ["multipart", "ws"] }
