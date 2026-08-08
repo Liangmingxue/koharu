@@ -18,6 +18,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::AppState;
 use crate::error::{ApiError, ApiResult};
+use crate::idempotency::{complete_json, replay_json, request_hash};
 
 pub fn router() -> OpenApiRouter<AppState> {
     OpenApiRouter::default()
@@ -81,11 +82,23 @@ async fn apply_command(
     Json(op): Json<Op>,
 ) -> ApiResult<Json<HistoryResult>> {
     let expected = parse_epoch_precondition(&headers)?;
+    let config = (**app.config.load()).clone();
+    let decision = app.idempotency().begin(
+        &config.data.path,
+        &headers,
+        "POST /history/apply",
+        request_hash("POST /history/apply", &(expected, &op))?,
+    )?;
+    if let Some(response) = replay_json::<HistoryResult>(&decision)? {
+        return Ok(Json(response));
+    }
     let epoch = match expected {
         Some(epoch) => app.apply_if_epoch(epoch, op).map_err(map_apply_error)?,
         None => app.apply(op).map_err(ApiError::internal)?,
     };
-    Ok(Json(HistoryResult { epoch: Some(epoch) }))
+    let response = HistoryResult { epoch: Some(epoch) };
+    complete_json(app.idempotency(), decision, &response)?;
+    Ok(Json(response))
 }
 
 pub(crate) fn parse_epoch_precondition(headers: &HeaderMap) -> ApiResult<Option<u64>> {

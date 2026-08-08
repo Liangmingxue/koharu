@@ -267,7 +267,8 @@ export function RenderControlsPanel() {
   const currentEffect = normalizeEffect(selectedStyle?.effect ?? renderEffect)
   // The scene only persists manual overrides in `style.fontSize`. Font detector
   // metadata describes the source text, not the renderer's current auto-fit size.
-  const currentFontSize: number | undefined = selectedNode?.data.style?.fontSize ?? undefined
+  const currentFontSize: number | undefined =
+    (selectedNode ?? firstNode)?.data.style?.fontSize ?? undefined
 
   const effectiveAlign: TextAlign =
     selectedNode?.data.style?.textAlign ??
@@ -326,6 +327,11 @@ export function RenderControlsPanel() {
 
   const applyStyleToAll = (updates: Partial<TextStyle>) => {
     applyStyleToNodes(textNodes, updates, 'Bulk style update')
+  }
+
+  const applyStyleToCurrentScope = (updates: Partial<TextStyle>) => {
+    if (applyStyleToSelected(updates)) return
+    applyStyleToAll(updates)
   }
 
   const commitCurrentFontColorIfImplicit = () => {
@@ -565,10 +571,11 @@ export function RenderControlsPanel() {
             variant='ghost'
             size='icon-sm'
             className='size-6 shrink-0 rounded-r-none border-r'
-            disabled={!selectedNode}
+            data-testid='render-font-size-decrease'
+            disabled={!hasNodes}
             onClick={() => {
               const next = Math.max(6, Math.round((currentFontSize ?? 16) - 1))
-              applyStyleToSelected({ fontSize: next })
+              applyStyleToCurrentScope({ fontSize: next })
             }}
           >
             <MinusIcon className='size-3' />
@@ -581,16 +588,16 @@ export function RenderControlsPanel() {
             inputMode='numeric'
             className='h-6 min-w-0 flex-1 [appearance:textfield] rounded-none border-0 px-0.5 text-center text-xs shadow-none focus-visible:ring-0 [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none'
             data-testid='render-font-size'
-            disabled={!selectedNode}
+            disabled={!hasNodes}
             value={currentFontSize !== undefined ? Math.round(currentFontSize) : ''}
             placeholder='auto'
             onChange={(event) => {
               if (event.target.value === '') {
-                applyStyleToSelected({ fontSize: null })
+                applyStyleToCurrentScope({ fontSize: null })
               }
               const parsed = Number.parseInt(event.target.value, 10)
               if (!Number.isFinite(parsed) || parsed < 1) return
-              applyStyleToSelected({ fontSize: Math.min(300, parsed) })
+              applyStyleToCurrentScope({ fontSize: Math.min(300, parsed) })
             }}
           />
           <Button
@@ -598,10 +605,11 @@ export function RenderControlsPanel() {
             variant='ghost'
             size='icon-sm'
             className='size-6 shrink-0 rounded-l-none border-l'
-            disabled={!selectedNode}
+            data-testid='render-font-size-increase'
+            disabled={!hasNodes}
             onClick={() => {
               const next = Math.min(300, Math.round((currentFontSize ?? 16) + 1))
-              applyStyleToSelected({ fontSize: next })
+              applyStyleToCurrentScope({ fontSize: next })
             }}
           >
             <PlusIcon className='size-3' />

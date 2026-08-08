@@ -14,6 +14,7 @@ pub mod binary;
 pub mod bootstrap;
 pub mod error;
 pub mod events;
+pub mod idempotency;
 pub mod mcp;
 pub mod psd_export;
 pub mod routes;

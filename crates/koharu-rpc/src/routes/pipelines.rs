@@ -9,6 +9,7 @@ use std::sync::atomic::AtomicBool;
 
 use axum::Json;
 use axum::extract::State;
+use axum::http::HeaderMap;
 use koharu_app::pipeline::{
     self, PipelineRunOptions, PipelineSpec, ProgressTick, Scope, WarningTick,
 };
@@ -22,6 +23,7 @@ use uuid::Uuid;
 
 use crate::AppState;
 use crate::error::{ApiError, ApiResult};
+use crate::idempotency::{complete_json, replay_json, request_hash};
 use crate::routes::operations::{register_cancel, unregister_cancel};
 
 pub fn router() -> OpenApiRouter<AppState> {
@@ -70,6 +72,7 @@ pub struct StartPipelineResponse {
 )]
 async fn start_pipeline(
     State(app): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<StartPipelineRequest>,
 ) -> ApiResult<Json<StartPipelineResponse>> {
     let session = app
@@ -96,6 +99,16 @@ async fn start_pipeline(
         return Err(ApiError::bad_request(
             "current deterministic pipeline adapter only supports an empty engineConfig",
         ));
+    }
+    let config = (**app.config.load()).clone();
+    let decision = app.idempotency().begin(
+        &config.data.path,
+        &headers,
+        "POST /pipelines",
+        request_hash("POST /pipelines", &(session.dir.as_str(), &req))?,
+    )?;
+    if let Some(response) = replay_json::<StartPipelineResponse>(&decision)? {
+        return Ok(Json(response));
     }
     let spec = PipelineSpec {
         scope: match req.pages {
@@ -213,5 +226,7 @@ async fn start_pipeline(
         unregister_cancel(&op_id_c);
     });
 
-    Ok(Json(StartPipelineResponse { operation_id }))
+    let response = StartPipelineResponse { operation_id };
+    complete_json(app.idempotency(), decision, &response)?;
+    Ok(Json(response))
 }

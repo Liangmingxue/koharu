@@ -1,6 +1,19 @@
 //! Binary entry point. Wires `koharu-app::App` to the axum router plus
 //! (optionally) Tauri.
 
+// 这是最重要的启动文件，负责把各部分组装起来：
+
+// 读取 CLI 参数。
+// 加载配置。
+// 创建 RuntimeManager。
+// 准备模型运行环境。
+// 创建 koharu_app::App。
+// 启动 Axum HTTP 服务。
+// 决定运行 Headless 还是 Tauri GUI。
+// 默认监听 127.0.0.1:4000。
+
+// Headless 和桌面版本共用同一套 Rust 业务层和 HTTP API。
+
 use std::sync::Arc;
 
 use anyhow::{Context, Result};

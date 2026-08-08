@@ -63,7 +63,7 @@ fn build_text_blocks(regions: &[LayoutRegion]) -> Vec<([f32; 4], TextData)> {
         .iter()
         .filter(|r| {
             let l = r.label.to_ascii_lowercase();
-            l == "content" || l.contains("text") || l.contains("title")
+            l == "chart" || l == "content" || l.contains("text") || l.contains("title")
         })
         .filter_map(|r| {
             let x1 = r.bbox[0].min(r.bbox[2]).max(0.0);
@@ -147,5 +147,14 @@ mod tests {
     fn tall_region_is_vertical() {
         let blocks = build_text_blocks(&[region("text", [5.0, 5.0, 20.0, 60.0])]);
         assert_eq!(blocks[0].1.source_direction, Some(TextDirection::Vertical));
+    }
+
+    #[test]
+    fn chart_region_is_available_to_ocr() {
+        let blocks = build_text_blocks(&[region("chart", [4.0, 6.0, 124.0, 92.0])]);
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].0, [4.0, 6.0, 124.0, 92.0]);
+        assert_eq!(blocks[0].1.detector.as_deref(), Some(DETECTOR_NAME));
     }
 }

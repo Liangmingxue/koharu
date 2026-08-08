@@ -9,20 +9,16 @@ pub fn writing_mode_for_block(block: &RenderBlock) -> WritingMode {
     if block.text.is_empty() {
         return WritingMode::Horizontal;
     }
-    // Non-CJK text always lays out horizontally regardless of bubble shape —
-    // an English translation in a tall manga bubble still reads left-to-right.
-    if !is_cjk_text(&block.text) {
-        return WritingMode::Horizontal;
-    }
-    // CJK content: prefer the OCR/detector's source direction when available,
-    // so bubble aspect ratio doesn't override a trusted signal. The bbox
-    // heuristic is kept only as a fallback for user-added blocks that have
-    // no recorded source direction.
+    // An explicit detector direction is geometry metadata and must remain
+    // stable when the source text is replaced by a translation.
     match block.source_direction {
         Some(TextDirection::Vertical) => WritingMode::VerticalRl,
         Some(TextDirection::Horizontal) => WritingMode::Horizontal,
         None => {
-            if block.height > block.width {
+            // Without detector metadata, ordinary Latin text remains
+            // horizontal. CJK user-created blocks may infer vertical writing
+            // from a tall layout box.
+            if is_cjk_text(&block.text) && block.height > block.width {
                 WritingMode::VerticalRl
             } else {
                 WritingMode::Horizontal
@@ -247,6 +243,19 @@ mod tests {
         };
 
         assert_eq!(writing_mode_for_block(&block), WritingMode::Horizontal);
+    }
+
+    #[test]
+    fn writing_mode_honors_vertical_source_direction_for_latin_text() {
+        let block = RenderBlock {
+            width: 40.0,
+            height: 120.0,
+            text: "Aug-15".to_string(),
+            source_direction: Some(crate::types::TextDirection::Vertical),
+            ..Default::default()
+        };
+
+        assert_eq!(writing_mode_for_block(&block), WritingMode::VerticalRl);
     }
 
     #[test]

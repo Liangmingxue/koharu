@@ -203,6 +203,7 @@ function TextBlockItem({
 
   const w = t.width * scale
   const h = t.height * scale
+  const rotation = t.rotationDeg ?? 0
 
   return (
     <div
@@ -212,7 +213,8 @@ function TextBlockItem({
         position: 'absolute',
         top: 0,
         left: 0,
-        transform: `translate(${t.x * scale}px, ${t.y * scale}px)`,
+        transform: `translate(${t.x * scale}px, ${t.y * scale}px) rotate(${rotation}deg)`,
+        transformOrigin: 'center',
         width: w,
         height: h,
         pointerEvents: interactive ? 'auto' : 'none',
@@ -222,14 +224,16 @@ function TextBlockItem({
       }}
     >
       <div
-        className={`absolute inset-0 rounded-md ${selected
-          ? 'border-[3px] border-primary bg-primary/15'
-          : 'border-2 border-rose-400/60 bg-rose-400/5'
-          }`}
+        className={`absolute inset-0 rounded-md ${
+          selected
+            ? 'border-[3px] border-primary bg-primary/15'
+            : 'border-2 border-rose-400/60 bg-rose-400/5'
+        }`}
       />
       <div
-        className={`pointer-events-none absolute -top-1.5 -left-1.5 flex h-4 w-4 items-center justify-center rounded-full text-[9px] font-semibold text-white shadow ${selected ? 'bg-primary' : 'bg-rose-400'
-          }`}
+        className={`pointer-events-none absolute -top-1.5 -left-1.5 flex h-4 w-4 items-center justify-center rounded-full text-[9px] font-semibold text-white shadow ${
+          selected ? 'bg-primary' : 'bg-rose-400'
+        }`}
       >
         {index + 1}
       </div>
@@ -245,6 +249,7 @@ function BlockSprite({ node, scale }: { node: TextNodeEntry; scale: number }) {
   const spriteT = node.data.spriteTransform
   const x = (spriteT?.x ?? node.transform.x) * scale
   const y = (spriteT?.y ?? node.transform.y) * scale
+  const rotation = spriteT?.rotationDeg ?? node.transform.rotationDeg ?? 0
   return (
     <img
       alt=''
@@ -254,8 +259,8 @@ function BlockSprite({ node, scale }: { node: TextNodeEntry; scale: number }) {
       style={{
         top: 0,
         left: 0,
-        transformOrigin: 'top left',
-        transform: `translate(${x}px, ${y}px) scale(${scale})`,
+        transformOrigin: 'center',
+        transform: `translate(${x}px, ${y}px) scale(${scale}) rotate(${rotation}deg)`,
       }}
     />
   )

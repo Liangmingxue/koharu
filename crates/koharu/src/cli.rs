@@ -19,3 +19,11 @@ pub(crate) struct Cli {
     #[arg(long, help = "Enable debug console output")]
     pub(crate) debug: bool,
 }
+
+// --download    下载运行库后退出
+// --cpu         强制只使用 CPU   ,  后续这里改成使用GPU
+// --port        指定 HTTP 端口
+// --host        指定监听地址
+// --headless    不启动桌面窗口
+// --debug       开启调试控制台
+// koharu --headless --host 127.0.0.1 --port 4000

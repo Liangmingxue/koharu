@@ -12,7 +12,7 @@
 use axum::Json;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
-use axum::http::{HeaderValue, header};
+use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::{IntoResponse, Response};
 use koharu_app::projects as project_dirs;
 use koharu_core::{ImageRole, PageId, ProjectSummary};
@@ -21,6 +21,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::AppState;
 use crate::error::{ApiError, ApiResult};
+use crate::idempotency::{complete_json, replay_json, request_hash};
 
 pub fn router() -> OpenApiRouter<AppState> {
     OpenApiRouter::default()
@@ -72,6 +73,7 @@ pub struct CreateProjectRequest {
 )]
 async fn create_project(
     State(app): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<CreateProjectRequest>,
 ) -> ApiResult<Json<ProjectSummary>> {
     let trimmed = req.name.trim();
@@ -79,6 +81,15 @@ async fn create_project(
         return Err(ApiError::bad_request("name must not be empty"));
     }
     let config = (**app.config.load()).clone();
+    let decision = app.idempotency().begin(
+        &config.data.path,
+        &headers,
+        "POST /projects",
+        request_hash("POST /projects", &req)?,
+    )?;
+    if let Some(response) = replay_json::<ProjectSummary>(&decision)? {
+        return Ok(Json(response));
+    }
     let path = project_dirs::allocate_named(&config, trimmed).map_err(ApiError::internal)?;
     // `allocate_named` atomically created the directory so concurrent
     // callers can't collide. Session::create wants an empty-or-missing dir
@@ -89,7 +100,9 @@ async fn create_project(
         .open_project(path, Some(trimmed.to_string()))
         .await
         .map_err(ApiError::internal)?;
-    Ok(Json(koharu_app::app::project_summary(&session)))
+    let response = koharu_app::app::project_summary(&session);
+    complete_json(app.idempotency(), decision, &response)?;
+    Ok(Json(response))
 }
 
 // ---------------------------------------------------------------------------
