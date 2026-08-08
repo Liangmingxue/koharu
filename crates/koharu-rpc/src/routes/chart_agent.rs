@@ -3,13 +3,13 @@ use serde::Serialize;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::AppState;
-use crate::error::{ApiError, ApiResult};
+use crate::error::ApiResult;
 
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct ChartAgentCapabilities {
     pub protocol_version: &'static str,
     pub runtime_version: &'static str,
-    pub scene_epoch: u64,
+    pub scene_epoch: Option<u64>,
     pub capability_ids: Vec<&'static str>,
     pub supported_edit_types: Vec<&'static str>,
 }
@@ -24,14 +24,12 @@ pub fn router() -> OpenApiRouter<AppState> {
     responses((status = 200, body = ChartAgentCapabilities))
 )]
 async fn get_capabilities(State(app): State<AppState>) -> ApiResult<Json<ChartAgentCapabilities>> {
-    let session = app
-        .current_session()
-        .ok_or_else(|| ApiError::bad_request("no project open"))?;
+    let scene_epoch = app.current_session().map(|session| session.epoch());
 
     Ok(Json(ChartAgentCapabilities {
         protocol_version: "koharu-chart-agent.v1",
         runtime_version: env!("CARGO_PKG_VERSION"),
-        scene_epoch: session.epoch(),
+        scene_epoch,
         capability_ids: vec![
             "scene.conditional_epoch",
             "scene.batch_patch",
