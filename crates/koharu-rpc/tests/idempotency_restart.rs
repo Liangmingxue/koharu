@@ -17,6 +17,9 @@ fn completed_receipt_survives_store_recreation() {
 
     let reopened = IdempotencyStore::default();
     let receipt = reopened.lookup(root, "request-1").unwrap();
-    assert_eq!(receipt.state, koharu_rpc::idempotency::ReceiptState::Completed);
+    assert_eq!(
+        receipt.state,
+        koharu_rpc::idempotency::ReceiptState::Completed
+    );
     assert_eq!(receipt.response, Some(serde_json::json!({"ok": true})));
 }
