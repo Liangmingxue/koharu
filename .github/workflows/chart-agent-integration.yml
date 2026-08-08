@@ -1,0 +1,23 @@
+name: Chart Agent integration
+
+on:
+  pull_request:
+    paths:
+      - "crates/koharu-rpc/**"
+      - ".github/workflows/chart-agent-integration.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rpc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p koharu-rpc --test chart_agent_capabilities --test idempotency_restart
+      - run: cargo fmt --check
