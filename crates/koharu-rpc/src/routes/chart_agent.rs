@@ -3,6 +3,7 @@ use axum::extract::State;
 use koharu_app::ProjectSession;
 use koharu_core::FontFaceInfo;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::AppState;
@@ -120,7 +121,7 @@ fn capabilities_for(
         },
         font_inventory: FontInventoryBindingV1 {
             inventory_version: "koharu-font-inventory.v1",
-            inventory_hash: format!("blake3:{}", blake3::hash(&font_bytes).to_hex()),
+            inventory_hash: format!("sha256:{:x}", Sha256::digest(&font_bytes)),
             family_names,
         },
     }
@@ -149,6 +150,14 @@ mod tests {
         assert_eq!(body["schemaVersion"], "koharu-chart-agent-capabilities.v1");
         assert_eq!(body["sceneEpoch"], session.epoch());
         assert!(body["sceneEpoch"].is_u64());
+        let inventory_hash = body["fontInventory"]["inventoryHash"].as_str().unwrap();
+        assert_eq!(inventory_hash.len(), "sha256:".len() + 64);
+        assert!(inventory_hash.starts_with("sha256:"));
+        assert!(
+            inventory_hash["sha256:".len()..]
+                .chars()
+                .all(|value| value.is_ascii_digit() || ('a'..='f').contains(&value))
+        );
         assert!(
             body["supportedEditTypes"]
                 .as_array()
