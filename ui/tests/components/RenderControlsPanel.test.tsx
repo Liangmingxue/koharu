@@ -170,6 +170,34 @@ describe('RenderControlsPanel Font Assignment', () => {
     expect(input).toHaveAttribute('placeholder', 'auto')
   })
 
+  it('applies font size to every block when no block is selected', async () => {
+    renderWithQuery(<RenderControlsPanel />)
+
+    const increase = await screen.findByTestId('render-font-size-increase')
+    expect(increase).toBeEnabled()
+    await userEvent.click(increase)
+
+    await waitFor(() => expect(sceneActions.applyOp).toHaveBeenCalled())
+    const op = (sceneActions.applyOp as any).mock.calls[0][0]
+    expect(op.batch.ops).toHaveLength(2)
+    expect(op.batch.ops[0].updateNode.patch.data.text.style.fontSize).toBe(17)
+    expect(op.batch.ops[1].updateNode.patch.data.text.style.fontSize).toBe(17)
+    expect(sceneActions.queueAutoRender).toHaveBeenCalledWith('p1')
+  })
+
+  it('keeps font size changes scoped to selected blocks', async () => {
+    renderWithQuery(<RenderControlsPanel />)
+    useSelectionStore.getState().select('t1', false)
+
+    const decrease = await screen.findByTestId('render-font-size-decrease')
+    await userEvent.click(decrease)
+
+    await waitFor(() => expect(sceneActions.applyOp).toHaveBeenCalled())
+    const op = (sceneActions.applyOp as any).mock.calls[0][0]
+    expect(op.updateNode.id).toBe('t1')
+    expect(op.updateNode.patch.data.text.style.fontSize).toBe(15)
+  })
+
   it('opening the font color picker commits effective black as an explicit color', async () => {
     server.use(
       http.get('/api/v1/scene.json', () =>

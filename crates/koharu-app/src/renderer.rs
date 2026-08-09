@@ -13,7 +13,8 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use image::{DynamicImage, GrayImage, RgbaImage, imageops};
+use image::{DynamicImage, GrayImage, Rgba, RgbaImage, imageops};
+use imageproc::geometric_transformations::{Border, Interpolation, rotate_about_center_no_crop};
 use koharu_core::{
     FontFaceInfo, FontPrediction, FontSource, NodeId, TextDirection, TextShaderEffect,
     TextStrokeStyle, TextStyle, Transform,
@@ -202,8 +203,11 @@ impl Renderer {
             imageops::overlay(&mut canvas, &brush.to_rgba8(), 0, 0);
         }
         for out in &rendered_blocks {
-            let (x, y) = placement_origin(find_input(blocks, out.node_id), &out.expanded_transform);
-            imageops::overlay(&mut canvas, &out.sprite.to_rgba8(), x as i64, y as i64);
+            let input = find_input(blocks, out.node_id);
+            let transform = out.expanded_transform.unwrap_or(input.transform);
+            let sprite = rotate_sprite(&out.sprite.to_rgba8(), transform.rotation_deg);
+            let (x, y) = centred_origin(transform, sprite.width(), sprite.height());
+            imageops::overlay(&mut canvas, &sprite, x, y);
         }
         Ok(RenderOutput {
             final_render: DynamicImage::ImageRgba8(canvas),
@@ -1008,12 +1012,40 @@ fn find_input(blocks: &[RenderBlockInput], id: NodeId) -> &RenderBlockInput {
         .expect("rendered_block must have matching input")
 }
 
-fn placement_origin(input: &RenderBlockInput, expanded: &Option<Transform>) -> (f32, f32) {
-    if let Some(t) = expanded {
-        (t.x.round(), t.y.round())
-    } else {
-        (input.transform.x, input.transform.y)
+fn rotate_sprite(sprite: &RgbaImage, rotation_deg: f32) -> RgbaImage {
+    let angle = normalize_rotation(rotation_deg);
+    if angle.abs() < 0.01 {
+        return sprite.clone();
     }
+    if (angle - 90.0).abs() < 0.01 {
+        return imageops::rotate90(sprite);
+    }
+    if (angle + 90.0).abs() < 0.01 {
+        return imageops::rotate270(sprite);
+    }
+    if angle.abs() > 179.99 {
+        return imageops::rotate180(sprite);
+    }
+
+    rotate_about_center_no_crop(
+        sprite,
+        angle.to_radians(),
+        Interpolation::Bilinear,
+        Border::Constant(Rgba([0, 0, 0, 0])),
+    )
+}
+
+fn normalize_rotation(angle: f32) -> f32 {
+    (angle + 180.0).rem_euclid(360.0) - 180.0
+}
+
+fn centred_origin(transform: Transform, width: u32, height: u32) -> (i64, i64) {
+    let center_x = transform.x + transform.width * 0.5;
+    let center_y = transform.y + transform.height * 0.5;
+    (
+        (center_x - width as f32 * 0.5).round() as i64,
+        (center_y - height as f32 * 0.5).round() as i64,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1352,5 +1384,29 @@ mod tests {
         // Sprite (100x50) centered on (200, 150) starts at (150, 125).
         assert_eq!(transform.x, 150.0);
         assert_eq!(transform.y, 125.0);
+    }
+
+    #[test]
+    fn quarter_turn_rotates_sprite_without_clipping() {
+        let mut sprite = RgbaImage::new(4, 2);
+        sprite.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
+
+        let rotated = rotate_sprite(&sprite, 90.0);
+
+        assert_eq!(rotated.dimensions(), (2, 4));
+        assert_eq!(*rotated.get_pixel(1, 0), Rgba([255, 0, 0, 255]));
+    }
+
+    #[test]
+    fn rotated_sprite_keeps_transform_center() {
+        let transform = Transform {
+            x: 100.0,
+            y: 50.0,
+            width: 80.0,
+            height: 20.0,
+            rotation_deg: 90.0,
+        };
+
+        assert_eq!(centred_origin(transform, 20, 80), (130, 20));
     }
 }
