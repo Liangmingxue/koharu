@@ -112,9 +112,7 @@ impl IdempotencyStore {
             .lock
             .lock()
             .map_err(|_| ApiError::internal(anyhow::anyhow!("idempotency lock poisoned")))?;
-        fs::create_dir_all(reservation.root.as_std_path()).map_err(|error| {
-            ApiError::internal(anyhow::Error::new(error).context("create idempotency receipt root"))
-        })?;
+        ensure_receipt_root(data_root).map_err(ApiError::internal)?;
         let path = receipt_path(&reservation.root, &reservation.key);
         if path.exists() {
             let receipt = read_receipt(&path).map_err(ApiError::internal)?;
@@ -270,6 +268,20 @@ fn receipt_path(root: &Utf8Path, key: &str) -> Utf8PathBuf {
     root.join(format!("{}.json", blake3::hash(key.as_bytes()).to_hex()))
 }
 
+fn ensure_receipt_root(data_root: &Utf8Path) -> Result<()> {
+    let root = data_root.join("http-idempotency");
+    let created = !root.exists();
+    fs::create_dir_all(root.as_std_path())
+        .with_context(|| format!("create idempotency receipt root {root}"))?;
+    if created {
+        File::open(data_root.as_std_path())
+            .with_context(|| format!("open idempotency receipt parent {data_root}"))?
+            .sync_all()
+            .with_context(|| format!("sync idempotency receipt parent {data_root}"))?;
+    }
+    Ok(())
+}
+
 fn read_receipt(path: &Utf8Path) -> Result<IdempotencyReceipt> {
     let bytes = fs::read(path.as_std_path()).with_context(|| format!("read receipt {path}"))?;
     let receipt: IdempotencyReceipt =
@@ -298,7 +310,8 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue};
 
     use super::{
-        Decision, IdempotencyStore, ReceiptState, complete_json, replay_json, request_hash,
+        Decision, IdempotencyStore, ReceiptState, complete_json, ensure_receipt_root, replay_json,
+        request_hash,
     };
 
     fn request_headers() -> HeaderMap {
@@ -370,5 +383,19 @@ mod tests {
             reopened.lookup(data_root, "request-1").unwrap().response,
             Some(expected_response)
         );
+    }
+
+    #[test]
+    fn receipt_root_creation_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_root = camino::Utf8Path::from_path(temp.path())
+            .unwrap()
+            .join("data");
+        std::fs::create_dir(data_root.as_std_path()).unwrap();
+
+        ensure_receipt_root(&data_root).unwrap();
+        assert!(data_root.join("http-idempotency").is_dir());
+
+        ensure_receipt_root(&data_root).unwrap();
     }
 }
