@@ -251,18 +251,26 @@ function BlockSprite({ node, scale }: { node: TextNodeEntry; scale: number }) {
   const y = (spriteT?.y ?? node.transform.y) * scale
   const rotation = spriteT?.rotationDeg ?? node.transform.rotationDeg ?? 0
   return (
-    <img
-      alt=''
-      src={src}
-      draggable={false}
+    <div
       className='pointer-events-none absolute select-none'
       style={{
-        top: 0,
-        left: 0,
-        transformOrigin: 'center',
-        transform: `translate(${x}px, ${y}px) scale(${scale}) rotate(${rotation}deg)`,
+        top: y,
+        left: x,
+        transformOrigin: 'top left',
+        transform: `scale(${scale})`,
       }}
-    />
+    >
+      <img
+        alt=''
+        src={src}
+        draggable={false}
+        className='block select-none'
+        style={{
+          transformOrigin: 'center',
+          transform: `rotate(${rotation}deg)`,
+        }}
+      />
+    </div>
   )
 }
 

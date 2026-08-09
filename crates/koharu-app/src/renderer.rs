@@ -205,8 +205,7 @@ impl Renderer {
         for out in &rendered_blocks {
             let input = find_input(blocks, out.node_id);
             let transform = out.expanded_transform.unwrap_or(input.transform);
-            let sprite = rotate_sprite(&out.sprite.to_rgba8(), transform.rotation_deg);
-            let (x, y) = centred_origin(transform, sprite.width(), sprite.height());
+            let (sprite, x, y) = positioned_sprite(&out.sprite.to_rgba8(), transform);
             imageops::overlay(&mut canvas, &sprite, x, y);
         }
         Ok(RenderOutput {
@@ -704,17 +703,17 @@ fn sprite_collides_with_bubble_mask(
     mask: &GrayImage,
     bubble_id: u8,
 ) -> bool {
-    let origin_x = transform.x.round() as i32;
-    let origin_y = transform.y.round() as i32;
-    let mask_w = mask.width() as i32;
-    let mask_h = mask.height() as i32;
+    // Validate the exact alpha geometry later composited onto the page.
+    let (sprite, origin_x, origin_y) = positioned_sprite(sprite, *transform);
+    let mask_w = i64::from(mask.width());
+    let mask_h = i64::from(mask.height());
 
     for (x, y, pixel) in sprite.enumerate_pixels() {
         if pixel.0[3] <= MASK_COLLISION_ALPHA_THRESHOLD {
             continue;
         }
-        let mask_x = origin_x + x as i32;
-        let mask_y = origin_y + y as i32;
+        let mask_x = origin_x + i64::from(x);
+        let mask_y = origin_y + i64::from(y);
         if mask_x < 0 || mask_y < 0 || mask_x >= mask_w || mask_y >= mask_h {
             return true;
         }
@@ -1039,6 +1038,13 @@ fn normalize_rotation(angle: f32) -> f32 {
     (angle + 180.0).rem_euclid(360.0) - 180.0
 }
 
+/// Prepare the same rotated, centre-anchored sprite for validation and paint.
+fn positioned_sprite(sprite: &RgbaImage, transform: Transform) -> (RgbaImage, i64, i64) {
+    let sprite = rotate_sprite(sprite, transform.rotation_deg);
+    let (x, y) = centred_origin(transform, sprite.width(), sprite.height());
+    (sprite, x, y)
+}
+
 fn centred_origin(transform: Transform, width: u32, height: u32) -> (i64, i64) {
     let center_x = transform.x + transform.width * 0.5;
     let center_y = transform.y + transform.height * 0.5;
@@ -1280,6 +1286,26 @@ mod tests {
         };
 
         assert!(!sprite_collides_with_bubble_mask(
+            &sprite, &transform, &mask, 1
+        ));
+    }
+
+    #[test]
+    fn mask_collision_checks_rotated_sprite_at_final_origin() {
+        let mut mask = GrayImage::from_pixel(10, 10, Luma([0u8]));
+        paint_rect(&mut mask, 3, 4, 7, 6, 1);
+        let sprite = RgbaImage::from_pixel(4, 2, Rgba([0, 0, 0, 255]));
+        let transform = Transform {
+            x: 3.0,
+            y: 4.0,
+            width: 4.0,
+            height: 2.0,
+            rotation_deg: 90.0,
+        };
+
+        // The unrotated 4x2 sprite fits. Its final 2x4 alpha extends above
+        // and below the bubble after rotation around the same centre.
+        assert!(sprite_collides_with_bubble_mask(
             &sprite, &transform, &mask, 1
         ));
     }
