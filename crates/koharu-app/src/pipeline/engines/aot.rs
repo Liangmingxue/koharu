@@ -17,11 +17,12 @@ use koharu_ml::types::TextRegion;
 use crate::pipeline::artifacts::Artifact;
 use crate::pipeline::engine::{Engine, EngineCtx, EngineInfo};
 use crate::pipeline::engines::support::{
-    find_image_node, find_mask_node, image_dimensions, load_source_image, text_node_to_region,
-    text_nodes, upsert_image_blob,
+    clip_mask_to_text_nodes, find_image_node, find_mask_node, image_dimensions, load_source_image,
+    text_node_to_region, text_nodes_in_scope, upsert_image_blob,
 };
 
 pub struct Model(AotInpainting);
+const TEXT_SCOPE_PADDING_PX: u32 = 4;
 
 #[async_trait]
 impl Engine for Model {
@@ -30,8 +31,18 @@ impl Engine for Model {
             .ok_or_else(|| anyhow!("no Segment mask on page"))?;
         let (_, bubble_ref) = find_mask_node(ctx.scene, ctx.page, MaskRole::Bubble)
             .ok_or_else(|| anyhow!("no Bubble mask on page"))?;
-        let mask = ctx.blobs.load_image(&mask_ref)?;
-        let bubble_mask = ctx.blobs.load_image(&bubble_ref)?;
+        let mut mask = ctx.blobs.load_image(&mask_ref)?;
+        let mut bubble_mask = ctx.blobs.load_image(&bubble_ref)?;
+        let scoped_nodes =
+            text_nodes_in_scope(ctx.scene, ctx.page, ctx.options.text_node_ids.as_deref())?;
+        if ctx.options.text_node_ids.is_some() {
+            if scoped_nodes.is_empty() {
+                return Ok(Vec::new());
+            }
+            mask = clip_mask_to_text_nodes(&mask, &scoped_nodes, TEXT_SCOPE_PADDING_PX);
+            bubble_mask =
+                clip_mask_to_text_nodes(&bubble_mask, &scoped_nodes, TEXT_SCOPE_PADDING_PX);
+        }
 
         let (image, mask, bubble_mask) = match ctx.options.region {
             Some(r) => {
@@ -48,14 +59,22 @@ impl Engine for Model {
                 (image, mask, bubble_mask)
             }
         };
-        let text_blocks: Vec<TextRegion> = text_nodes(ctx.scene, ctx.page)
+        let text_blocks: Vec<TextRegion> = scoped_nodes
             .into_iter()
             .map(|(_, transform, text)| text_node_to_region(transform, text))
             .collect();
         let expanded = expand_mask_for_inpainting(&mask, &bubble_mask, &text_blocks);
+        let expanded = DynamicImage::ImageLuma8(expanded);
+        let expanded = if ctx.options.text_node_ids.is_some() {
+            let scoped_nodes =
+                text_nodes_in_scope(ctx.scene, ctx.page, ctx.options.text_node_ids.as_deref())?;
+            clip_mask_to_text_nodes(&expanded, &scoped_nodes, TEXT_SCOPE_PADDING_PX)
+        } else {
+            expanded
+        };
         let mask = match ctx.options.region {
-            Some(r) => clip_mask_to_region(&DynamicImage::ImageLuma8(expanded), &r),
-            None => DynamicImage::ImageLuma8(expanded),
+            Some(r) => clip_mask_to_region(&expanded, &r),
+            None => expanded,
         };
 
         let result = self.0.inference(&image, &mask, &bubble_mask)?;

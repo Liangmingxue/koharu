@@ -4223,6 +4223,7 @@ dependencies = [
  "dashmap",
  "fs4",
  "image",
+ "imageproc",
  "inventory",
  "koharu-ai",
  "koharu-core",
