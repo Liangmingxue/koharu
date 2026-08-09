@@ -25,6 +25,7 @@ use std::sync::Arc;
 pub use api::{ApiState, api, router};
 pub use bootstrap::BootstrapManager;
 pub use error::{ApiError, ApiResult};
+pub use routes::chart_agent::ChartAgentCapabilitiesV1;
 
 /// Concrete state threaded through every `State<ApiState>` extractor.
 pub type AppState = Arc<BootstrapManager>;
