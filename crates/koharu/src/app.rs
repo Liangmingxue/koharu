@@ -9,6 +9,7 @@ use koharu_app::{App, AppConfig, config as app_config};
 use koharu_rpc::{BootstrapManager, server};
 use koharu_runtime::{ComputePolicy, RuntimeHttpConfig, RuntimeManager};
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -112,19 +113,38 @@ pub async fn run() -> Result<()> {
 
     let mut context = tauri::generate_context!();
     let assets = crate::assets::from_context(&mut context);
-    let server_state = state.clone();
-    tauri::async_runtime::spawn(async move {
-        server::serve_with_listener_and_assets(listener, server_state, assets)
-            .await
-            .expect("failed to start server");
-    });
 
     if cli.headless {
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_state = state.clone();
+        let server_handle = tokio::spawn(server::serve_with_listener_and_assets_until_shutdown(
+            listener,
+            server_state,
+            assets,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
         tracing::info!(port, "headless: open http://127.0.0.1:{port}/ in a browser");
-        bootstrap_app(state, config, cli.cpu).await?;
-        tokio::signal::ctrl_c().await?;
-        return Ok(());
+        let lifecycle_result = async {
+            bootstrap_app(state, config, cli.cpu).await?;
+            tokio::signal::ctrl_c().await?;
+            Ok(())
+        }
+        .await;
+        let _ = shutdown_tx.send(());
+        server_handle.await.context("server task failed")??;
+        return lifecycle_result;
     }
+
+    let server_state = state.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) =
+            server::serve_with_listener_and_assets(listener, server_state, assets).await
+        {
+            tracing::error!(%error, "server stopped");
+        }
+    });
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())

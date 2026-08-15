@@ -3,6 +3,7 @@
 //! Also exposes an `AssetResolver` hook so the Tauri binary can bolt its
 //! embedded frontend onto unmatched routes.
 
+use std::future::Future;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -66,5 +67,21 @@ pub async fn serve_with_listener_and_assets(
     resolver: AssetResolver,
 ) -> Result<()> {
     axum::serve(listener, router_with_assets(app, resolver)).await?;
+    Ok(())
+}
+
+/// Serve embedded assets until the caller requests graceful shutdown.
+pub async fn serve_with_listener_and_assets_until_shutdown<F>(
+    listener: TcpListener,
+    app: AppState,
+    resolver: AssetResolver,
+    shutdown: F,
+) -> Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    axum::serve(listener, router_with_assets(app, resolver))
+        .with_graceful_shutdown(shutdown)
+        .await?;
     Ok(())
 }
