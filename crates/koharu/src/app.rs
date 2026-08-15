@@ -10,7 +10,7 @@ use koharu_app::{App, AppConfig, config as app_config};
 use koharu_rpc::{BootstrapManager, server};
 use koharu_runtime::{ComputePolicy, RuntimeHttpConfig, RuntimeManager};
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -21,20 +21,55 @@ async fn bootstrap_app(
     state: Arc<BootstrapManager>,
     config: AppConfig,
     cpu_only: bool,
+    mut cancellation: Option<watch::Receiver<bool>>,
 ) -> Result<()> {
     let runtime = state.runtime();
-    runtime
-        .prepare()
-        .await
-        .context("failed to prepare runtime")?;
+    {
+        let prepare = runtime.prepare();
+        tokio::pin!(prepare);
+        if let Some(cancellation) = cancellation.as_mut() {
+            tokio::select! {
+                result = &mut prepare => result.context("failed to prepare runtime")?,
+                changed = cancellation.changed() => {
+                    if changed.is_ok() && *cancellation.borrow() {
+                        return Ok(());
+                    }
+                    prepare.await.context("failed to prepare runtime")?;
+                }
+            }
+        } else {
+            prepare.await.context("failed to prepare runtime")?;
+        }
+    }
 
-    let app = Arc::new(App::new_with_shared_state(
-        config,
-        runtime,
-        cpu_only,
-        state.shared_state(),
-        crate::version::current(),
-    )?);
+    if cancellation
+        .as_ref()
+        .is_some_and(|cancellation| *cancellation.borrow())
+    {
+        return Ok(());
+    }
+
+    let shared_state = state.shared_state();
+    let app = tokio::task::spawn_blocking(move || {
+        App::new_with_shared_state(
+            config,
+            runtime,
+            cpu_only,
+            shared_state,
+            crate::version::current(),
+        )
+        .map(Arc::new)
+    })
+    .await
+    .context("application bootstrap task failed")??;
+
+    if cancellation
+        .as_ref()
+        .is_some_and(|cancellation| *cancellation.borrow())
+    {
+        return Ok(());
+    }
+
     koharu_llm::suppress_native_logs();
     app.spawn_llm_forwarder();
     state
@@ -43,38 +78,53 @@ async fn bootstrap_app(
     Ok(())
 }
 
-pub async fn supervise_headless_server<Bootstrap, ShutdownSignal, ApplicationShutdown>(
+pub async fn supervise_headless_server<
+    Bootstrap,
+    RequestBootstrapCancellation,
+    ShutdownSignal,
+    ApplicationShutdown,
+>(
     mut server_handle: JoinHandle<Result<()>>,
     shutdown_tx: oneshot::Sender<()>,
     bootstrap: Bootstrap,
+    request_bootstrap_cancellation: RequestBootstrapCancellation,
     shutdown_signal: ShutdownSignal,
     application_shutdown: ApplicationShutdown,
 ) -> Result<()>
 where
     Bootstrap: Future<Output = Result<()>>,
+    RequestBootstrapCancellation: FnOnce(),
     ShutdownSignal: Future<Output = Result<()>>,
     ApplicationShutdown: Future<Output = Result<()>>,
 {
     let mut bootstrap = Box::pin(bootstrap);
     let mut shutdown_signal = Box::pin(shutdown_signal);
+    let mut request_bootstrap_cancellation = Some(request_bootstrap_cancellation);
     let initial_event = tokio::select! {
         result = &mut server_handle => HeadlessEvent::Server(result),
         result = &mut shutdown_signal => HeadlessEvent::Shutdown(result),
         result = &mut bootstrap => HeadlessEvent::Bootstrap(result),
     };
 
-    let lifecycle_result = match initial_event {
+    let (bootstrap_result, lifecycle_result) = match initial_event {
         HeadlessEvent::Server(result) => {
-            drop(bootstrap);
+            request_bootstrap_cancellation
+                .take()
+                .expect("bootstrap cancellation is requested at most once")();
+            let bootstrap_result = bootstrap.await;
             drop(shutdown_signal);
             let application_result = application_shutdown.await;
             premature_server_result(result)?;
-            return application_result;
+            application_result?;
+            return bootstrap_result;
         }
         HeadlessEvent::Shutdown(result) => {
-            drop(bootstrap);
+            request_bootstrap_cancellation
+                .take()
+                .expect("bootstrap cancellation is requested at most once")();
+            let bootstrap_result = bootstrap.await;
             drop(shutdown_signal);
-            result
+            (bootstrap_result, result)
         }
         HeadlessEvent::Bootstrap(Ok(())) => {
             drop(bootstrap);
@@ -87,16 +137,17 @@ where
                 HeadlessEvent::Server(result) => {
                     let application_result = application_shutdown.await;
                     premature_server_result(result)?;
-                    return application_result;
+                    application_result?;
+                    return Ok(());
                 }
-                HeadlessEvent::Shutdown(result) => result,
+                HeadlessEvent::Shutdown(result) => (Ok(()), result),
                 HeadlessEvent::Bootstrap(_) => unreachable!(),
             }
         }
         HeadlessEvent::Bootstrap(Err(error)) => {
             drop(bootstrap);
             drop(shutdown_signal);
-            Err(error)
+            (Err(error), Ok(()))
         }
     };
 
@@ -109,6 +160,7 @@ where
     if shutdown_receiver_closed {
         anyhow::bail!("server shutdown receiver was cancelled");
     }
+    bootstrap_result?;
     lifecycle_result
 }
 
@@ -215,10 +267,14 @@ pub async fn run() -> Result<()> {
         tracing::info!(port, "headless: open http://127.0.0.1:{port}/ in a browser");
         let bootstrap_state = state.clone();
         let shutdown_state = state.clone();
+        let (cancel_bootstrap_tx, cancel_bootstrap_rx) = watch::channel(false);
         return supervise_headless_server(
             server_handle,
             shutdown_tx,
-            bootstrap_app(bootstrap_state, config, cli.cpu),
+            bootstrap_app(bootstrap_state, config, cli.cpu, Some(cancel_bootstrap_rx)),
+            move || {
+                let _ = cancel_bootstrap_tx.send(true);
+            },
             async {
                 tokio::signal::ctrl_c().await?;
                 Ok(())
@@ -252,7 +308,7 @@ pub async fn run() -> Result<()> {
         .plugin(tauri_plugin_process::init())
         .setup(move |handle| {
             tauri::async_runtime::spawn(async move {
-                bootstrap_app(state, config, cli.cpu)
+                bootstrap_app(state, config, cli.cpu, None)
                     .await
                     .expect("failed to bootstrap app");
             });

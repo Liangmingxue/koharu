@@ -269,11 +269,9 @@ pub(crate) async fn ensure_ready(runtime: &Runtime) -> Result<()> {
     Ok(())
 }
 
-fn should_preload_library(library: &str, wants_gpu: bool) -> bool {
-    if wants_gpu {
-        return true;
-    }
-
+fn should_preload_library(library: &str, _wants_gpu: bool) -> bool {
+    // Backend plugins are selected and loaded exactly once by koharu-llm.
+    // Runtime preparation owns only the common libraries both policies need.
     matches!(
         library.to_ascii_lowercase().as_str(),
         // Linux common dependencies.
@@ -403,18 +401,26 @@ mod tests {
     }
 
     #[test]
-    fn gpu_preload_keeps_all_packaged_libraries_for_load_all() {
-        for library in [
-            "libggml-cpu-alderlake.so",
-            "libggml-vulkan.so",
-            "libggml-rpc.so",
-            "libggml-blas.dylib",
-            "libggml-future-backend.so",
-            "cudart64_13.dll",
-        ] {
-            assert!(
+    fn gpu_preload_keeps_common_dependencies_and_leaves_plugins_to_load_all() {
+        let cases = [
+            ("libggml-base.so", true),
+            ("libggml.so", true),
+            ("libllama.so", true),
+            ("libmtmd.so", true),
+            ("libomp140.x86_64.dll", true),
+            ("libggml-cpu-alderlake.so", false),
+            ("libggml-vulkan.so", false),
+            ("libggml-rpc.so", false),
+            ("libggml-blas.dylib", false),
+            ("libggml-future-backend.so", false),
+            ("cudart64_13.dll", false),
+        ];
+
+        for (library, expected) in cases {
+            assert_eq!(
                 should_preload_library(library, true),
-                "GPU policy must retain {library}"
+                expected,
+                "unexpected GPU preload ownership for {library}"
             );
         }
     }

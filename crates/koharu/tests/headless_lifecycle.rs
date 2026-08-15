@@ -1,8 +1,6 @@
-use std::future::{self, Future};
-use std::pin::Pin;
+use std::future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -13,13 +11,20 @@ use tokio::sync::oneshot;
 async fn early_serve_error_is_returned_without_waiting_for_shutdown_signal() -> Result<()> {
     let server = tokio::spawn(async { Err(anyhow!("serve failed")) });
     let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+    let (cancel_bootstrap_tx, cancel_bootstrap_rx) = oneshot::channel();
 
     let error = tokio::time::timeout(
         Duration::from_secs(1),
         supervise_headless_server(
             server,
             shutdown_tx,
-            future::pending::<Result<()>>(),
+            async move {
+                cancel_bootstrap_rx.await?;
+                Ok(())
+            },
+            move || {
+                let _ = cancel_bootstrap_tx.send(());
+            },
             future::pending::<Result<()>>(),
             async { Ok(()) },
         ),
@@ -58,6 +63,7 @@ async fn accepted_project_history_route_drains_before_application_cleanup() -> R
             server,
             shutdown_tx,
             async { Ok(()) },
+            || {},
             async { Ok(()) },
             async move {
                 anyhow::ensure!(
@@ -95,6 +101,7 @@ async fn closed_shutdown_receiver_propagates_simultaneous_serve_error() -> Resul
             server,
             shutdown_tx,
             async { Ok(()) },
+            || {},
             async move {
                 receiver_closed_rx.await?;
                 let _ = finish_server_tx.send(());
@@ -110,34 +117,33 @@ async fn closed_shutdown_receiver_propagates_simultaneous_serve_error() -> Resul
     Ok(())
 }
 
-struct DropFlag(Arc<AtomicBool>);
-
-impl Future for DropFlag {
-    type Output = Result<()>;
-
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Poll::Pending
-    }
-}
-
-impl Drop for DropFlag {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::SeqCst);
-    }
-}
-
 #[tokio::test]
-async fn shutdown_before_bootstrap_completion_cancels_bootstrap_then_drains() -> Result<()> {
+async fn shutdown_during_non_cancellation_safe_bootstrap_joins_before_drain() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let bootstrap_dropped = Arc::new(AtomicBool::new(false));
+    let (cancel_bootstrap_tx, cancel_bootstrap_rx) = oneshot::channel();
+    let (bootstrap_started_tx, bootstrap_started_rx) = oneshot::channel();
+    let bootstrap_finished = Arc::new(AtomicBool::new(false));
     let server_completed = Arc::new(AtomicBool::new(false));
+    let bootstrap_finished_in_server = bootstrap_finished.clone();
     let server_completed_in_task = server_completed.clone();
     let server = tokio::spawn(async move {
         shutdown_rx.await?;
+        anyhow::ensure!(
+            bootstrap_finished_in_server.load(Ordering::SeqCst),
+            "server drain began before non-cancellation-safe bootstrap work joined"
+        );
         server_completed_in_task.store(true, Ordering::SeqCst);
         Ok(())
     });
-    let bootstrap_dropped_in_cleanup = bootstrap_dropped.clone();
+    let bootstrap_finished_in_task = bootstrap_finished.clone();
+    let bootstrap = async move {
+        let _ = bootstrap_started_tx.send(());
+        cancel_bootstrap_rx.await?;
+        tokio::task::yield_now().await;
+        bootstrap_finished_in_task.store(true, Ordering::SeqCst);
+        Ok(())
+    };
+    let bootstrap_finished_in_cleanup = bootstrap_finished.clone();
     let server_completed_in_cleanup = server_completed.clone();
 
     tokio::time::timeout(
@@ -145,12 +151,18 @@ async fn shutdown_before_bootstrap_completion_cancels_bootstrap_then_drains() ->
         supervise_headless_server(
             server,
             shutdown_tx,
-            DropFlag(bootstrap_dropped.clone()),
-            async { Ok(()) },
+            bootstrap,
+            move || {
+                let _ = cancel_bootstrap_tx.send(());
+            },
+            async move {
+                bootstrap_started_rx.await?;
+                Ok(())
+            },
             async move {
                 anyhow::ensure!(
-                    bootstrap_dropped_in_cleanup.load(Ordering::SeqCst),
-                    "bootstrap ownership remained live during cleanup"
+                    bootstrap_finished_in_cleanup.load(Ordering::SeqCst),
+                    "bootstrap work was not joined before application cleanup"
                 );
                 anyhow::ensure!(
                     server_completed_in_cleanup.load(Ordering::SeqCst),
@@ -162,7 +174,71 @@ async fn shutdown_before_bootstrap_completion_cancels_bootstrap_then_drains() ->
     )
     .await??;
 
-    assert!(bootstrap_dropped.load(Ordering::SeqCst));
+    assert!(bootstrap_finished.load(Ordering::SeqCst));
     assert!(server_completed.load(Ordering::SeqCst));
+    Ok(())
+}
+
+#[tokio::test]
+async fn shutdown_racing_bootstrap_error_drains_then_propagates_error() -> Result<()> {
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (cancel_bootstrap_tx, cancel_bootstrap_rx) = oneshot::channel();
+    let (bootstrap_started_tx, bootstrap_started_rx) = oneshot::channel();
+    let bootstrap_finished = Arc::new(AtomicBool::new(false));
+    let server_completed = Arc::new(AtomicBool::new(false));
+    let cleanup_count = Arc::new(AtomicUsize::new(0));
+
+    let bootstrap_finished_in_server = bootstrap_finished.clone();
+    let server_completed_in_task = server_completed.clone();
+    let server = tokio::spawn(async move {
+        shutdown_rx.await?;
+        anyhow::ensure!(
+            bootstrap_finished_in_server.load(Ordering::SeqCst),
+            "server drain raced unfinished bootstrap error"
+        );
+        server_completed_in_task.store(true, Ordering::SeqCst);
+        Ok(())
+    });
+
+    let bootstrap_finished_in_task = bootstrap_finished.clone();
+    let bootstrap = async move {
+        let _ = bootstrap_started_tx.send(());
+        cancel_bootstrap_rx.await?;
+        bootstrap_finished_in_task.store(true, Ordering::SeqCst);
+        Err(anyhow!("bootstrap failed after cancellation request"))
+    };
+    let server_completed_in_cleanup = server_completed.clone();
+    let cleanup_count_in_task = cleanup_count.clone();
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        supervise_headless_server(
+            server,
+            shutdown_tx,
+            bootstrap,
+            move || {
+                let _ = cancel_bootstrap_tx.send(());
+            },
+            async move {
+                bootstrap_started_rx.await?;
+                Ok(())
+            },
+            async move {
+                anyhow::ensure!(
+                    server_completed_in_cleanup.load(Ordering::SeqCst),
+                    "application cleanup ran before server drain"
+                );
+                cleanup_count_in_task.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        ),
+    )
+    .await?
+    .expect_err("bootstrap error racing shutdown must propagate");
+
+    assert!(format!("{error:#}").contains("bootstrap failed after cancellation request"));
+    assert!(bootstrap_finished.load(Ordering::SeqCst));
+    assert!(server_completed.load(Ordering::SeqCst));
+    assert_eq!(cleanup_count.load(Ordering::SeqCst), 1);
     Ok(())
 }
