@@ -13,6 +13,7 @@ use tar::Archive;
 const GGML_FUNCTIONS: &[&str] = &[
     "ggml_backend_dev_count",
     "ggml_backend_dev_get",
+    "ggml_backend_load",
     "ggml_backend_load_all_from_path",
 ];
 

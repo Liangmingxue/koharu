@@ -261,10 +261,26 @@ pub(crate) async fn ensure_ready(runtime: &Runtime) -> Result<()> {
 
     add_runtime_search_path(&install_dir)?;
     for library in distribution.libraries() {
-        preload_library(&install_dir.join(library))?;
+        if should_preload_library(library, runtime.wants_gpu()) {
+            preload_library(&install_dir.join(library))?;
+        }
     }
 
     Ok(())
+}
+
+fn should_preload_library(library: &str, wants_gpu: bool) -> bool {
+    wants_gpu
+        || !matches!(
+            library.to_ascii_lowercase().as_str(),
+            "cudart64_13.dll"
+                | "cublaslt64_13.dll"
+                | "cublas64_13.dll"
+                | "ggml-cuda.dll"
+                | "ggml-vulkan.dll"
+                | "libggml-vulkan.so"
+                | "libggml-metal.dylib"
+        )
 }
 
 pub(crate) fn runtime_dir(runtime: &Runtime) -> Result<PathBuf> {
@@ -330,6 +346,14 @@ mod tests {
             .collect();
         assert!(paths.iter().all(|path| path.exists()));
         assert_eq!(paths.len(), runtime.libraries().len());
+    }
+
+    #[test]
+    fn cpu_preload_skips_accelerator_plugin_but_keeps_cpu_plugin() {
+        assert!(!should_preload_library("libggml-vulkan.so", false));
+        assert!(should_preload_library("libggml-vulkan.so", true));
+        assert!(should_preload_library("libggml-cpu-alderlake.so", false));
+        assert!(should_preload_library("libllama.so", false));
     }
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]

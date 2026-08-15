@@ -1,6 +1,7 @@
 //! Binary entry point. Wires `koharu-app::App` to the axum router plus
 //! (optionally) Tauri.
 
+use std::future::Future;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -10,6 +11,7 @@ use koharu_rpc::{BootstrapManager, server};
 use koharu_runtime::{ComputePolicy, RuntimeHttpConfig, RuntimeManager};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -39,6 +41,68 @@ async fn bootstrap_app(
         .set_app(app)
         .map_err(|_| anyhow::anyhow!("app already initialized"))?;
     Ok(())
+}
+
+pub async fn supervise_headless_server<Bootstrap, ShutdownSignal, ApplicationShutdown>(
+    mut server_handle: JoinHandle<Result<()>>,
+    shutdown_tx: oneshot::Sender<()>,
+    bootstrap: Bootstrap,
+    shutdown_signal: ShutdownSignal,
+    application_shutdown: ApplicationShutdown,
+) -> Result<()>
+where
+    Bootstrap: Future<Output = Result<()>>,
+    ShutdownSignal: Future<Output = Result<()>>,
+    ApplicationShutdown: Future<Output = Result<()>>,
+{
+    tokio::pin!(bootstrap);
+    let bootstrap_result = tokio::select! {
+        result = &mut server_handle => {
+            let application_result = application_shutdown.await;
+            premature_server_result(result)?;
+            return application_result;
+        }
+        result = &mut bootstrap => result,
+    };
+
+    let lifecycle_result = match bootstrap_result {
+        Ok(()) => {
+            tokio::pin!(shutdown_signal);
+            tokio::select! {
+                result = &mut server_handle => {
+                    let application_result = application_shutdown.await;
+                    premature_server_result(result)?;
+                    return application_result;
+                }
+                result = &mut shutdown_signal => result,
+            }
+        }
+        Err(error) => Err(error),
+    };
+
+    if shutdown_tx.send(()).is_err() {
+        let application_result = application_shutdown.await;
+        server_handle.abort();
+        let _ = server_handle.await;
+        application_result?;
+        anyhow::bail!("server shutdown receiver was cancelled");
+    }
+
+    let application_result = application_shutdown.await;
+    let server_result = server_handle.await.context("server task failed")?;
+    server_result?;
+    application_result?;
+    lifecycle_result
+}
+
+fn premature_server_result(
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+) -> Result<()> {
+    match result {
+        Ok(Ok(())) => anyhow::bail!("server stopped before headless shutdown"),
+        Ok(Err(error)) => Err(error).context("server stopped before headless shutdown"),
+        Err(error) => Err(error).context("server task failed before headless shutdown"),
+    }
 }
 
 pub async fn run() -> Result<()> {
@@ -126,15 +190,26 @@ pub async fn run() -> Result<()> {
             },
         ));
         tracing::info!(port, "headless: open http://127.0.0.1:{port}/ in a browser");
-        let lifecycle_result = async {
-            bootstrap_app(state, config, cli.cpu).await?;
-            tokio::signal::ctrl_c().await?;
-            Ok(())
-        }
+        let bootstrap_state = state.clone();
+        let shutdown_state = state.clone();
+        return supervise_headless_server(
+            server_handle,
+            shutdown_tx,
+            bootstrap_app(bootstrap_state, config, cli.cpu),
+            async {
+                tokio::signal::ctrl_c().await?;
+                Ok(())
+            },
+            async move {
+                if let Some(app) = shutdown_state.app() {
+                    app.close_project()
+                        .await
+                        .context("failed to close project during shutdown")?;
+                }
+                Ok(())
+            },
+        )
         .await;
-        let _ = shutdown_tx.send(());
-        server_handle.await.context("server task failed")??;
-        return lifecycle_result;
     }
 
     let server_state = state.clone();
