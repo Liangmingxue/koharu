@@ -55,44 +55,67 @@ where
     ShutdownSignal: Future<Output = Result<()>>,
     ApplicationShutdown: Future<Output = Result<()>>,
 {
-    tokio::pin!(bootstrap);
-    let bootstrap_result = tokio::select! {
-        result = &mut server_handle => {
+    let mut bootstrap = Box::pin(bootstrap);
+    let mut shutdown_signal = Box::pin(shutdown_signal);
+    let initial_event = tokio::select! {
+        result = &mut server_handle => HeadlessEvent::Server(result),
+        result = &mut shutdown_signal => HeadlessEvent::Shutdown(result),
+        result = &mut bootstrap => HeadlessEvent::Bootstrap(result),
+    };
+
+    let lifecycle_result = match initial_event {
+        HeadlessEvent::Server(result) => {
+            drop(bootstrap);
+            drop(shutdown_signal);
             let application_result = application_shutdown.await;
             premature_server_result(result)?;
             return application_result;
         }
-        result = &mut bootstrap => result,
-    };
-
-    let lifecycle_result = match bootstrap_result {
-        Ok(()) => {
-            tokio::pin!(shutdown_signal);
-            tokio::select! {
-                result = &mut server_handle => {
+        HeadlessEvent::Shutdown(result) => {
+            drop(bootstrap);
+            drop(shutdown_signal);
+            result
+        }
+        HeadlessEvent::Bootstrap(Ok(())) => {
+            drop(bootstrap);
+            let event = tokio::select! {
+                result = &mut server_handle => HeadlessEvent::Server(result),
+                result = &mut shutdown_signal => HeadlessEvent::Shutdown(result),
+            };
+            drop(shutdown_signal);
+            match event {
+                HeadlessEvent::Server(result) => {
                     let application_result = application_shutdown.await;
                     premature_server_result(result)?;
                     return application_result;
                 }
-                result = &mut shutdown_signal => result,
+                HeadlessEvent::Shutdown(result) => result,
+                HeadlessEvent::Bootstrap(_) => unreachable!(),
             }
         }
-        Err(error) => Err(error),
+        HeadlessEvent::Bootstrap(Err(error)) => {
+            drop(bootstrap);
+            drop(shutdown_signal);
+            Err(error)
+        }
     };
 
-    if shutdown_tx.send(()).is_err() {
-        let application_result = application_shutdown.await;
-        server_handle.abort();
-        let _ = server_handle.await;
-        application_result?;
-        anyhow::bail!("server shutdown receiver was cancelled");
-    }
-
+    let shutdown_receiver_closed = shutdown_tx.send(()).is_err();
+    let server_result = server_handle.await;
     let application_result = application_shutdown.await;
-    let server_result = server_handle.await.context("server task failed")?;
+    let server_result = server_result.context("server task failed")?;
     server_result?;
     application_result?;
+    if shutdown_receiver_closed {
+        anyhow::bail!("server shutdown receiver was cancelled");
+    }
     lifecycle_result
+}
+
+enum HeadlessEvent {
+    Bootstrap(Result<()>),
+    Shutdown(Result<()>),
+    Server(std::result::Result<Result<()>, tokio::task::JoinError>),
 }
 
 fn premature_server_result(

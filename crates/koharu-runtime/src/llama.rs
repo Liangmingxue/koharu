@@ -270,17 +270,23 @@ pub(crate) async fn ensure_ready(runtime: &Runtime) -> Result<()> {
 }
 
 fn should_preload_library(library: &str, wants_gpu: bool) -> bool {
+    let library = library.to_ascii_lowercase();
     wants_gpu
-        || !matches!(
-            library.to_ascii_lowercase().as_str(),
-            "cudart64_13.dll"
-                | "cublaslt64_13.dll"
-                | "cublas64_13.dll"
-                | "ggml-cuda.dll"
-                | "ggml-vulkan.dll"
-                | "libggml-vulkan.so"
-                | "libggml-metal.dylib"
-        )
+        || (!is_cpu_backend_plugin(&library)
+            && !matches!(
+                library.as_str(),
+                "cudart64_13.dll"
+                    | "cublaslt64_13.dll"
+                    | "cublas64_13.dll"
+                    | "ggml-cuda.dll"
+                    | "ggml-vulkan.dll"
+                    | "libggml-vulkan.so"
+                    | "libggml-metal.dylib"
+            ))
+}
+
+fn is_cpu_backend_plugin(library: &str) -> bool {
+    library.starts_with("libggml-cpu") || library.starts_with("ggml-cpu")
 }
 
 pub(crate) fn runtime_dir(runtime: &Runtime) -> Result<PathBuf> {
@@ -349,11 +355,15 @@ mod tests {
     }
 
     #[test]
-    fn cpu_preload_skips_accelerator_plugin_but_keeps_cpu_plugin() {
+    fn cpu_preload_leaves_all_backend_plugins_to_llm_selection() {
         assert!(!should_preload_library("libggml-vulkan.so", false));
         assert!(should_preload_library("libggml-vulkan.so", true));
-        assert!(should_preload_library("libggml-cpu-alderlake.so", false));
+        assert!(!should_preload_library("libggml-cpu-alderlake.so", false));
+        assert!(!should_preload_library("libggml-cpu-sse42.so", false));
+        assert!(!should_preload_library("ggml-cpu-haswell.dll", false));
+        assert!(!should_preload_library("libggml-cpu.dylib", false));
         assert!(should_preload_library("libllama.so", false));
+        assert!(should_preload_library("libggml-base.so", false));
     }
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
