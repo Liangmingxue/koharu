@@ -270,23 +270,29 @@ pub(crate) async fn ensure_ready(runtime: &Runtime) -> Result<()> {
 }
 
 fn should_preload_library(library: &str, wants_gpu: bool) -> bool {
-    let library = library.to_ascii_lowercase();
-    wants_gpu
-        || (!is_cpu_backend_plugin(&library)
-            && !matches!(
-                library.as_str(),
-                "cudart64_13.dll"
-                    | "cublaslt64_13.dll"
-                    | "cublas64_13.dll"
-                    | "ggml-cuda.dll"
-                    | "ggml-vulkan.dll"
-                    | "libggml-vulkan.so"
-                    | "libggml-metal.dylib"
-            ))
-}
+    if wants_gpu {
+        return true;
+    }
 
-fn is_cpu_backend_plugin(library: &str) -> bool {
-    library.starts_with("libggml-cpu") || library.starts_with("ggml-cpu")
+    matches!(
+        library.to_ascii_lowercase().as_str(),
+        // Linux common dependencies.
+        "libggml-base.so"
+            | "libggml.so"
+            | "libllama.so"
+            | "libmtmd.so"
+            // Windows common dependencies.
+            | "libomp140.x86_64.dll"
+            | "ggml-base.dll"
+            | "ggml.dll"
+            | "llama.dll"
+            | "mtmd.dll"
+            // macOS common dependencies.
+            | "libggml-base.dylib"
+            | "libggml.dylib"
+            | "libllama.dylib"
+            | "libmtmd.dylib"
+    )
 }
 
 pub(crate) fn runtime_dir(runtime: &Runtime) -> Result<PathBuf> {
@@ -355,15 +361,62 @@ mod tests {
     }
 
     #[test]
-    fn cpu_preload_leaves_all_backend_plugins_to_llm_selection() {
-        assert!(!should_preload_library("libggml-vulkan.so", false));
-        assert!(should_preload_library("libggml-vulkan.so", true));
-        assert!(!should_preload_library("libggml-cpu-alderlake.so", false));
-        assert!(!should_preload_library("libggml-cpu-sse42.so", false));
-        assert!(!should_preload_library("ggml-cpu-haswell.dll", false));
-        assert!(!should_preload_library("libggml-cpu.dylib", false));
-        assert!(should_preload_library("libllama.so", false));
-        assert!(should_preload_library("libggml-base.so", false));
+    fn cpu_preload_is_an_explicit_cross_platform_common_dependency_allowlist() {
+        let cases = [
+            // Linux common dependencies.
+            ("libggml-base.so", true),
+            ("libggml.so", true),
+            ("libllama.so", true),
+            ("libmtmd.so", true),
+            // Windows common dependencies.
+            ("libomp140.x86_64.dll", true),
+            ("ggml-base.dll", true),
+            ("ggml.dll", true),
+            ("llama.dll", true),
+            ("mtmd.dll", true),
+            // macOS common dependencies.
+            ("libggml-base.dylib", true),
+            ("libggml.dylib", true),
+            ("libllama.dylib", true),
+            ("libmtmd.dylib", true),
+            // Backend plugins stay owned by koharu-llm.
+            ("libggml-cpu-alderlake.so", false),
+            ("ggml-cpu-haswell.dll", false),
+            ("libggml-cpu.dylib", false),
+            ("libggml-cuda.so", false),
+            ("ggml-vulkan.dll", false),
+            ("libggml-metal.dylib", false),
+            ("libggml-rpc.so", false),
+            ("ggml-rpc.dll", false),
+            ("libggml-rpc.dylib", false),
+            ("libggml-blas.dylib", false),
+            ("libggml-future-backend.so", false),
+        ];
+
+        for (library, expected) in cases {
+            assert_eq!(
+                should_preload_library(library, false),
+                expected,
+                "unexpected CPU preload policy for {library}"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_preload_keeps_all_packaged_libraries_for_load_all() {
+        for library in [
+            "libggml-cpu-alderlake.so",
+            "libggml-vulkan.so",
+            "libggml-rpc.so",
+            "libggml-blas.dylib",
+            "libggml-future-backend.so",
+            "cudart64_13.dll",
+        ] {
+            assert!(
+                should_preload_library(library, true),
+                "GPU policy must retain {library}"
+            );
+        }
     }
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
