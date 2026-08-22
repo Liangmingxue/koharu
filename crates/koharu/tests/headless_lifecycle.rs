@@ -1,6 +1,7 @@
 use std::future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -120,14 +121,20 @@ async fn closed_shutdown_receiver_propagates_simultaneous_serve_error() -> Resul
 #[tokio::test]
 async fn shutdown_during_non_cancellation_safe_bootstrap_joins_before_drain() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let (cancel_bootstrap_tx, cancel_bootstrap_rx) = oneshot::channel();
+    let (signal_tx, signal_rx) = oneshot::channel();
+    let (cancel_requested_tx, cancel_requested_rx) = oneshot::channel();
     let (bootstrap_started_tx, bootstrap_started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = mpsc::channel();
     let bootstrap_finished = Arc::new(AtomicBool::new(false));
+    let drain_started = Arc::new(AtomicBool::new(false));
+    let cleanup_started = Arc::new(AtomicBool::new(false));
     let server_completed = Arc::new(AtomicBool::new(false));
     let bootstrap_finished_in_server = bootstrap_finished.clone();
+    let drain_started_in_server = drain_started.clone();
     let server_completed_in_task = server_completed.clone();
     let server = tokio::spawn(async move {
         shutdown_rx.await?;
+        drain_started_in_server.store(true, Ordering::SeqCst);
         anyhow::ensure!(
             bootstrap_finished_in_server.load(Ordering::SeqCst),
             "server drain began before non-cancellation-safe bootstrap work joined"
@@ -137,44 +144,65 @@ async fn shutdown_during_non_cancellation_safe_bootstrap_joins_before_drain() ->
     });
     let bootstrap_finished_in_task = bootstrap_finished.clone();
     let bootstrap = async move {
-        let _ = bootstrap_started_tx.send(());
-        cancel_bootstrap_rx.await?;
-        tokio::task::yield_now().await;
-        bootstrap_finished_in_task.store(true, Ordering::SeqCst);
-        Ok(())
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let _ = bootstrap_started_tx.send(());
+            release_rx
+                .recv_timeout(Duration::from_secs(1))
+                .map_err(|error| anyhow!("blocking bootstrap release failed: {error}"))?;
+            bootstrap_finished_in_task.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .await??;
+        Ok::<(), anyhow::Error>(())
     };
     let bootstrap_finished_in_cleanup = bootstrap_finished.clone();
+    let cleanup_started_in_task = cleanup_started.clone();
     let server_completed_in_cleanup = server_completed.clone();
 
-    tokio::time::timeout(
-        Duration::from_secs(1),
-        supervise_headless_server(
-            server,
-            shutdown_tx,
-            bootstrap,
-            move || {
-                let _ = cancel_bootstrap_tx.send(());
-            },
-            async move {
-                bootstrap_started_rx.await?;
-                Ok(())
-            },
-            async move {
-                anyhow::ensure!(
-                    bootstrap_finished_in_cleanup.load(Ordering::SeqCst),
-                    "bootstrap work was not joined before application cleanup"
-                );
-                anyhow::ensure!(
-                    server_completed_in_cleanup.load(Ordering::SeqCst),
-                    "application cleanup ran before server drain"
-                );
-                Ok(())
-            },
-        ),
-    )
-    .await??;
+    let supervisor = tokio::spawn(supervise_headless_server(
+        server,
+        shutdown_tx,
+        bootstrap,
+        move || {
+            let _ = cancel_requested_tx.send(());
+        },
+        async move { signal_rx.await.map_err(Into::into) },
+        async move {
+            cleanup_started_in_task.store(true, Ordering::SeqCst);
+            anyhow::ensure!(
+                bootstrap_finished_in_cleanup.load(Ordering::SeqCst),
+                "bootstrap work was not joined before application cleanup"
+            );
+            anyhow::ensure!(
+                server_completed_in_cleanup.load(Ordering::SeqCst),
+                "application cleanup ran before server drain"
+            );
+            Ok(())
+        },
+    ));
+
+    tokio::time::timeout(Duration::from_secs(1), bootstrap_started_rx).await??;
+    signal_tx
+        .send(())
+        .map_err(|_| anyhow!("supervisor dropped shutdown signal receiver"))?;
+    tokio::time::timeout(Duration::from_secs(1), cancel_requested_rx).await??;
+    tokio::task::yield_now().await;
+
+    assert!(
+        !supervisor.is_finished(),
+        "supervisor completed before blocking bootstrap JoinHandle"
+    );
+    assert!(!drain_started.load(Ordering::SeqCst));
+    assert!(!cleanup_started.load(Ordering::SeqCst));
+
+    release_tx
+        .send(())
+        .map_err(|_| anyhow!("blocking bootstrap dropped release receiver"))?;
+    tokio::time::timeout(Duration::from_secs(1), supervisor).await???;
 
     assert!(bootstrap_finished.load(Ordering::SeqCst));
+    assert!(drain_started.load(Ordering::SeqCst));
+    assert!(cleanup_started.load(Ordering::SeqCst));
     assert!(server_completed.load(Ordering::SeqCst));
     Ok(())
 }

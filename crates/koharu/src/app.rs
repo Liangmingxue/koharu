@@ -29,6 +29,7 @@ async fn bootstrap_app(
         tokio::pin!(prepare);
         if let Some(cancellation) = cancellation.as_mut() {
             tokio::select! {
+                biased;
                 result = &mut prepare => result.context("failed to prepare runtime")?,
                 changed = cancellation.changed() => {
                     if changed.is_ok() && *cancellation.borrow() {
@@ -177,6 +178,51 @@ fn premature_server_result(
         Ok(Ok(())) => anyhow::bail!("server stopped before headless shutdown"),
         Ok(Err(error)) => Err(error).context("server stopped before headless shutdown"),
         Err(error) => Err(error).context("server task failed before headless shutdown"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::env;
+    use std::fs;
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use anyhow::Result;
+    use koharu_app::AppConfig;
+    use koharu_rpc::BootstrapManager;
+    use koharu_runtime::{ComputePolicy, RuntimeManager};
+    use tokio::sync::watch;
+
+    use super::bootstrap_app;
+
+    #[tokio::test]
+    async fn ready_runtime_prepare_error_wins_ready_cancellation() -> Result<()> {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let tempdir = env::temp_dir().join(format!(
+            "koharu-bootstrap-ready-error-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&tempdir)?;
+        let invalid_root = tempdir.join("not-a-directory");
+        fs::write(&invalid_root, b"file blocks runtime directory creation")?;
+        let runtime = Arc::new(RuntimeManager::new(&invalid_root, ComputePolicy::CpuOnly)?);
+        let state = BootstrapManager::new(runtime);
+
+        for _ in 0..64 {
+            let (cancel_tx, cancel_rx) = watch::channel(false);
+            cancel_tx.send(true)?;
+
+            let error = bootstrap_app(state.clone(), AppConfig::default(), true, Some(cancel_rx))
+                .await
+                .expect_err("a ready runtime prepare error must win ready cancellation");
+
+            assert!(format!("{error:#}").contains("failed to prepare runtime"));
+        }
+
+        fs::remove_file(invalid_root)?;
+        fs::remove_dir(tempdir)?;
+        Ok(())
     }
 }
 
