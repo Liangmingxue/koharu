@@ -17,8 +17,9 @@ use koharu_ml::types::TextRegion;
 use crate::pipeline::artifacts::Artifact;
 use crate::pipeline::engine::{Engine, EngineCtx, EngineInfo};
 use crate::pipeline::engines::support::{
-    clip_mask_to_text_nodes, find_image_node, find_mask_node, image_dimensions, load_source_image,
-    text_node_to_region, text_nodes_in_scope, upsert_image_blob,
+    clip_mask_to_text_nodes, exclude_unselected_text_nodes, find_image_node, find_mask_node,
+    image_dimensions, load_source_image, text_node_to_region, text_nodes_in_scope,
+    upsert_image_blob,
 };
 
 pub struct Model(AotInpainting);
@@ -68,7 +69,8 @@ impl Engine for Model {
         let expanded = if ctx.options.text_node_ids.is_some() {
             let scoped_nodes =
                 text_nodes_in_scope(ctx.scene, ctx.page, ctx.options.text_node_ids.as_deref())?;
-            clip_mask_to_text_nodes(&expanded, &scoped_nodes, TEXT_SCOPE_PADDING_PX)
+            let clipped = clip_mask_to_text_nodes(&expanded, &scoped_nodes, TEXT_SCOPE_PADDING_PX);
+            exclude_unselected_text_nodes(&clipped, ctx.scene, ctx.page, &scoped_nodes)
         } else {
             expanded
         };
