@@ -194,6 +194,7 @@ impl KoharuServer {
                 region: None,
                 ..Default::default()
             },
+            expected_epoch: session.epoch(),
         };
         let job_id = Uuid::new_v4().to_string();
         let cancel = Arc::new(AtomicBool::new(false));

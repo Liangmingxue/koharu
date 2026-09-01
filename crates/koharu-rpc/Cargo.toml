@@ -17,6 +17,7 @@ koharu-core = { workspace = true }
 koharu-psd = { workspace = true }
 koharu-runtime = { workspace = true }
 anyhow = { workspace = true }
+atomicwrites = { workspace = true }
 async-stream = { workspace = true }
 axum = { workspace = true }
 blake3 = { workspace = true }

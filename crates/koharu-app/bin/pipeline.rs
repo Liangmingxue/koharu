@@ -231,6 +231,7 @@ async fn run() -> Result<()> {
             region: None,
             ..Default::default()
         },
+        expected_epoch: session.epoch(),
     };
 
     // When translate is skipped, copy OCR text into the translation slot so

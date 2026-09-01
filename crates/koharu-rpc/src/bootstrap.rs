@@ -8,6 +8,7 @@ use koharu_core::{AppEvent, DownloadProgress, JobSummary};
 use koharu_runtime::RuntimeManager;
 
 use crate::idempotency::IdempotencyStore;
+use crate::operation_journal::OperationJournal;
 
 pub struct BootstrapManager {
     app: OnceLock<Arc<App>>,
@@ -34,8 +35,14 @@ impl BootstrapManager {
         self.app.get().is_some()
     }
 
-    pub fn set_app(&self, app: Arc<App>) -> Result<(), Arc<App>> {
-        self.app.set(app)
+    pub fn set_app(&self, app: Arc<App>) -> anyhow::Result<()> {
+        let config = (**app.config.load()).clone();
+        for operation in OperationJournal::default().recover(&config.data.path)? {
+            self.shared.jobs.insert(operation.id.clone(), operation);
+        }
+        self.app
+            .set(app)
+            .map_err(|_| anyhow::anyhow!("app already initialized"))
     }
 
     pub fn runtime(&self) -> Arc<RuntimeManager> {

@@ -12,10 +12,12 @@
 pub mod api;
 pub mod binary;
 pub mod bootstrap;
+mod durable_json;
 pub mod error;
 pub mod events;
 pub mod idempotency;
 pub mod mcp;
+pub mod operation_journal;
 pub mod psd_export;
 pub mod routes;
 pub mod server;

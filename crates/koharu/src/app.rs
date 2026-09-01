@@ -75,7 +75,7 @@ async fn bootstrap_app(
     app.spawn_llm_forwarder();
     state
         .set_app(app)
-        .map_err(|_| anyhow::anyhow!("app already initialized"))?;
+        .context("restore durable operations and initialize app")?;
     Ok(())
 }
 

@@ -18,7 +18,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::AppState;
 use crate::error::{ApiError, ApiResult};
-use crate::idempotency::{complete_json, replay_json, request_hash};
+use crate::idempotency::{complete_json, fail_json, replay_json, request_hash};
 
 pub fn router() -> OpenApiRouter<AppState> {
     OpenApiRouter::default()
@@ -140,7 +140,10 @@ async fn apply_command(
     if let Some(response) = replay_json::<HistoryResult>(&decision)? {
         return Ok(Json(response));
     }
-    let epoch = apply_to_session(&session, expected, op).map_err(map_apply_error)?;
+    let epoch = match apply_to_session(&session, expected, op).map_err(map_apply_error) {
+        Ok(epoch) => epoch,
+        Err(error) => return Err(fail_json(app.idempotency(), decision, error)),
+    };
     let response = HistoryResult { epoch: Some(epoch) };
     complete_json(app.idempotency(), decision, &response)?;
     Ok(Json(response))
