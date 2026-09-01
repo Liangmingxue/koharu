@@ -44,6 +44,22 @@ pub fn load_source_image(scene: &Scene, page: PageId, blobs: &BlobStore) -> Resu
     blobs.load_image(&img_data.blob)
 }
 
+/// Load the image that an inpaint operation should modify.
+///
+/// Explicitly scoped edits are cumulative: once an Inpainted layer exists,
+/// the next scoped edit must build on it instead of restoring source pixels.
+pub fn load_inpaint_base_image(
+    scene: &Scene,
+    page: PageId,
+    blobs: &BlobStore,
+    prefer_existing: bool,
+) -> Result<DynamicImage> {
+    if prefer_existing && let Some((_, blob)) = find_image_node(scene, page, ImageRole::Inpainted) {
+        return blobs.load_image(&blob);
+    }
+    load_source_image(scene, page, blobs)
+}
+
 /// Find a node of `Image { role }` on `page`, if any.
 pub fn find_image_node(scene: &Scene, page: PageId, role: ImageRole) -> Option<(NodeId, BlobRef)> {
     let page = scene.page(page)?;
@@ -616,7 +632,61 @@ pub fn sort_manga_reading_order<T>(blocks: &mut [([f32; 4], T)], order: ReadingO
 #[cfg(test)]
 mod tests {
     use super::*;
-    use koharu_core::{Node, NodeKind, Page, ReadingOrder, TextData, Transform};
+    use image::Rgba;
+    use koharu_core::{ImageData, Node, NodeKind, Page, ReadingOrder, TextData, Transform};
+    use tempfile::tempdir;
+
+    #[test]
+    fn scoped_inpaint_reuses_existing_inpainted_image() {
+        let dir = tempdir().unwrap();
+        let blobs = BlobStore::open(dir.path()).unwrap();
+        let source = blobs
+            .put_raw(&DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                2,
+                2,
+                Rgba([255, 0, 0, 255]),
+            )))
+            .unwrap();
+        let inpainted = blobs
+            .put_raw(&DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                2,
+                2,
+                Rgba([0, 0, 255, 255]),
+            )))
+            .unwrap();
+        let mut scene = Scene::default();
+        let mut page = Page::new("inpaint-base", 2, 2);
+        for (role, blob) in [
+            (ImageRole::Source, source),
+            (ImageRole::Inpainted, inpainted),
+        ] {
+            let id = NodeId::new();
+            page.nodes.insert(
+                id,
+                Node {
+                    id,
+                    transform: Transform::default(),
+                    visible: true,
+                    kind: NodeKind::Image(ImageData {
+                        role,
+                        blob,
+                        opacity: 1.0,
+                        natural_width: 2,
+                        natural_height: 2,
+                        name: None,
+                    }),
+                },
+            );
+        }
+        let page_id = page.id;
+        scene.pages.insert(page_id, page);
+
+        let scoped = load_inpaint_base_image(&scene, page_id, &blobs, true).unwrap();
+        let unscoped = load_inpaint_base_image(&scene, page_id, &blobs, false).unwrap();
+
+        assert_eq!(scoped.to_rgba8().get_pixel(0, 0), &Rgba([0, 0, 255, 255]));
+        assert_eq!(unscoped.to_rgba8().get_pixel(0, 0), &Rgba([255, 0, 0, 255]));
+    }
 
     #[test]
     fn test_reading_order_sort() {

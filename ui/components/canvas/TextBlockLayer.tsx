@@ -95,6 +95,9 @@ const isAdditiveEvent = (event: unknown): boolean => {
 
 const RESIZE_HANDLE_SIZE = 8
 
+export const textBoxTransform = (x: number, y: number, rotation: number): string =>
+  `translate(${x}px, ${y}px) rotate(${rotation}deg)`
+
 type ResizeEdge = { top: boolean; bottom: boolean; left: boolean; right: boolean }
 
 function TextBlockItem({
@@ -110,16 +113,15 @@ function TextBlockItem({
   const dragStart = useRef({ x: 0, y: 0, w: 0, h: 0 })
   const edgeRef = useRef<ResizeEdge | null>(null)
   const isResizeRef = useRef(false)
+  const t = node.transform
 
   const setBox = (x: number, y: number, w: number, h: number) => {
     const el = boxRef.current
     if (!el) return
-    el.style.transform = `translate(${x}px, ${y}px)`
+    el.style.transform = textBoxTransform(x, y, t.rotationDeg ?? 0)
     el.style.width = `${w}px`
     el.style.height = `${h}px`
   }
-
-  const t = node.transform
 
   const bind = useDrag(
     ({ first, last, movement: [mx, my], event, tap }) => {
@@ -213,7 +215,7 @@ function TextBlockItem({
         position: 'absolute',
         top: 0,
         left: 0,
-        transform: `translate(${t.x * scale}px, ${t.y * scale}px) rotate(${rotation}deg)`,
+        transform: textBoxTransform(t.x * scale, t.y * scale, rotation),
         transformOrigin: 'center',
         width: w,
         height: h,

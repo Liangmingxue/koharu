@@ -59,7 +59,7 @@ inventory::submit! {
 // ---------------------------------------------------------------------------
 
 fn build_text_blocks(regions: &[LayoutRegion]) -> Vec<([f32; 4], TextData)> {
-    let mut blocks: Vec<([f32; 4], TextData)> = regions
+    let candidates: Vec<(bool, [f32; 4], TextData)> = regions
         .iter()
         .filter(|r| {
             let l = r.label.to_ascii_lowercase();
@@ -87,9 +87,32 @@ fn build_text_blocks(regions: &[LayoutRegion]) -> Vec<([f32; 4], TextData)> {
                 detector: Some(DETECTOR_NAME.to_string()),
                 ..Default::default()
             };
-            Some(([x1, y1, x1 + w, y1 + h], text))
+            Some((
+                r.label.eq_ignore_ascii_case("chart"),
+                [x1, y1, x1 + w, y1 + h],
+                text,
+            ))
         })
         .collect();
+    let mut blocks = candidates
+        .iter()
+        .filter(|(is_chart, _, _)| !is_chart)
+        .map(|(_, bbox, data)| (*bbox, data.clone()))
+        .collect::<Vec<_>>();
+    // A chart region is useful as an OCR fallback, but it is a container and
+    // must not win overlap de-duplication over its more precise text children.
+    let chart_fallbacks = candidates
+        .iter()
+        .filter(|(is_chart, chart, _)| {
+            *is_chart
+                && !blocks.iter().any(|(child, _)| {
+                    let child_area = ((child[2] - child[0]) * (child[3] - child[1])).max(1.0);
+                    overlap(*chart, *child) / child_area >= OVERLAP_THRESHOLD
+                })
+        })
+        .map(|(_, bbox, data)| (*bbox, data.clone()))
+        .collect::<Vec<_>>();
+    blocks.extend(chart_fallbacks);
     if blocks.len() >= 2 {
         let mut out = Vec::with_capacity(blocks.len());
         for (bbox, data) in std::mem::take(&mut blocks) {
@@ -156,5 +179,18 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].0, [4.0, 6.0, 124.0, 92.0]);
         assert_eq!(blocks[0].1.detector.as_deref(), Some(DETECTOR_NAME));
+    }
+
+    #[test]
+    fn chart_container_does_not_suppress_contained_text() {
+        let blocks = build_text_blocks(&[
+            region("chart", [0.0, 0.0, 160.0, 100.0]),
+            region("text", [12.0, 12.0, 48.0, 28.0]),
+            region("title", [60.0, 8.0, 140.0, 26.0]),
+        ]);
+
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].0, [12.0, 12.0, 48.0, 28.0]);
+        assert_eq!(blocks[1].0, [60.0, 8.0, 140.0, 26.0]);
     }
 }

@@ -17,9 +17,8 @@ use koharu_ml::types::TextRegion;
 use crate::pipeline::artifacts::Artifact;
 use crate::pipeline::engine::{Engine, EngineCtx, EngineInfo};
 use crate::pipeline::engines::support::{
-    clip_mask_to_text_nodes, exclude_unselected_text_nodes, find_image_node, find_mask_node,
-    image_dimensions, load_source_image, text_node_to_region, text_nodes_in_scope,
-    upsert_image_blob,
+    clip_mask_to_text_nodes, exclude_unselected_text_nodes, find_mask_node, image_dimensions,
+    load_inpaint_base_image, text_node_to_region, text_nodes_in_scope, upsert_image_blob,
 };
 
 pub struct Model(AotInpainting);
@@ -45,20 +44,19 @@ impl Engine for Model {
                 clip_mask_to_text_nodes(&bubble_mask, &scoped_nodes, TEXT_SCOPE_PADDING_PX);
         }
 
-        let (image, mask, bubble_mask) = match ctx.options.region {
+        let image = load_inpaint_base_image(
+            ctx.scene,
+            ctx.page,
+            ctx.blobs,
+            ctx.options.region.is_some() || ctx.options.text_node_ids.is_some(),
+        )?;
+        let (mask, bubble_mask) = match ctx.options.region {
             Some(r) => {
-                let base = match find_image_node(ctx.scene, ctx.page, ImageRole::Inpainted) {
-                    Some((_, blob)) => ctx.blobs.load_image(&blob)?,
-                    None => load_source_image(ctx.scene, ctx.page, ctx.blobs)?,
-                };
                 let clipped_mask = clip_mask_to_region(&mask, &r);
                 let clipped_bubble = clip_mask_to_region(&bubble_mask, &r);
-                (base, clipped_mask, clipped_bubble)
+                (clipped_mask, clipped_bubble)
             }
-            None => {
-                let image = load_source_image(ctx.scene, ctx.page, ctx.blobs)?;
-                (image, mask, bubble_mask)
-            }
+            None => (mask, bubble_mask),
         };
         let text_blocks: Vec<TextRegion> = scoped_nodes
             .into_iter()

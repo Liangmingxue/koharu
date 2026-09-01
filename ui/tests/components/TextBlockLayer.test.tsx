@@ -1,7 +1,7 @@
 import { render } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { TextBlockLayer } from '@/components/canvas/TextBlockLayer'
+import { TextBlockLayer, textBoxTransform } from '@/components/canvas/TextBlockLayer'
 
 const hooks = vi.hoisted(() => ({
   useBlobImage: vi.fn(),
@@ -40,5 +40,9 @@ describe('TextBlockLayer sprite placement', () => {
     expect(frame).toHaveStyle({ left: '20px', top: '40px', transform: 'scale(2)' })
     expect(frame).toHaveStyle({ transformOrigin: 'top left' })
     expect(sprite).toHaveStyle({ transform: 'rotate(90deg)', transformOrigin: 'center' })
+  })
+
+  it('keeps rotation while a box is moved or resized', () => {
+    expect(textBoxTransform(24, 48, 90)).toBe('translate(24px, 48px) rotate(90deg)')
   })
 })
