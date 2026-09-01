@@ -157,7 +157,14 @@ pub fn exclude_unselected_text_nodes(
         .collect::<Vec<_>>();
     let src = mask.to_luma8();
     let (width, height) = src.dimensions();
-    let protected = text_node_region_mask(width, height, &excluded);
+    // Fractional OCR coordinates can cover one neighboring pixel in another
+    // rasterizer (for example Pillow floors 603.904 while imageproc rounds).
+    // A one-pixel guard keeps preserve/skip text immutable across repositories.
+    let protected = dilate(
+        &text_node_region_mask(width, height, &excluded),
+        Norm::LInf,
+        1,
+    );
     let mut clipped = src;
     for y in 0..height {
         for x in 0..width {
@@ -708,6 +715,48 @@ mod tests {
         let padded = clip_mask_to_text_nodes(&mask, &selected_nodes, 4);
         let protected =
             exclude_unselected_text_nodes(&padded, &scene, page_id, &selected_nodes).to_luma8();
+
+        assert_eq!(protected.get_pixel(9, 8).0[0], 255);
+        assert_eq!(protected.get_pixel(10, 8).0[0], 0);
+        assert_eq!(protected.get_pixel(11, 8).0[0], 0);
+    }
+
+    #[test]
+    fn fractional_preserved_polygon_protects_neighboring_raster_boundary() {
+        let mut scene = Scene::default();
+        let mut page = Page::new("fractional", 24, 16);
+        let selected = NodeId::new();
+        let preserved = NodeId::new();
+        for (id, polygon) in [
+            (
+                selected,
+                [[2.0, 4.0], [10.0, 4.0], [10.0, 12.0], [2.0, 12.0]],
+            ),
+            (
+                preserved,
+                [[11.9, 4.1], [18.2, 4.1], [18.2, 12.1], [11.9, 12.1]],
+            ),
+        ] {
+            page.nodes.insert(
+                id,
+                Node {
+                    id,
+                    transform: Transform::default(),
+                    visible: true,
+                    kind: NodeKind::Text(TextData {
+                        line_polygons: Some(vec![polygon]),
+                        ..TextData::default()
+                    }),
+                },
+            );
+        }
+        let page_id = page.id;
+        scene.pages.insert(page_id, page);
+        let selected_nodes = text_nodes_in_scope(&scene, page_id, Some(&[selected])).unwrap();
+        let mask = DynamicImage::ImageLuma8(GrayImage::from_pixel(24, 16, Luma([255])));
+
+        let protected =
+            exclude_unselected_text_nodes(&mask, &scene, page_id, &selected_nodes).to_luma8();
 
         assert_eq!(protected.get_pixel(10, 8).0[0], 255);
         assert_eq!(protected.get_pixel(11, 8).0[0], 0);
