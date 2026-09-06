@@ -828,17 +828,31 @@ fn load_symbol_fallbacks(fontbook: &mut FontBook) -> Vec<Font> {
 
 fn face_post_script_name(faces: &[FaceInfo], candidate: &str) -> Option<String> {
     let candidate_lower = candidate.trim().to_lowercase();
+    // An explicit face name keeps its requested weight/style, including Thin.
+    if let Some(face) = faces.iter().find(|face| {
+        !face.post_script_name.is_empty() && face.post_script_name.to_lowercase() == candidate_lower
+    }) {
+        return Some(face.post_script_name.clone());
+    }
+    // A family-only request must not depend on OS font enumeration order.
     faces
         .iter()
-        .find(|face| {
-            face.post_script_name.to_lowercase() == candidate_lower
-                || face
+        .filter(|face| {
+            !face.post_script_name.is_empty()
+                && face
                     .families
                     .iter()
                     .any(|(family, _)| family.to_lowercase() == candidate_lower)
         })
+        .min_by_key(|face| {
+            (
+                face.style != Default::default(),
+                face.stretch != Default::default(),
+                face.weight.0.abs_diff(400),
+                face.post_script_name.clone(),
+            )
+        })
         .map(|face| face.post_script_name.clone())
-        .filter(|post_script_name| !post_script_name.is_empty())
 }
 
 fn layout_source_from_input(block: &RenderBlockInput, translation: &str) -> RenderBlock {
@@ -1391,6 +1405,37 @@ mod tests {
         }
 
         panic!("no system font available for tests");
+    }
+
+    #[test]
+    fn family_resolution_prefers_regular_but_preserves_explicit_face() {
+        let book = FontBook::new();
+        let mut regular = book.all_families().into_iter().next().expect("system font");
+        regular.families[0].0 = "Test Chart Family".into();
+        regular.post_script_name = "TestChart-Regular".into();
+        regular.style = Default::default();
+        regular.stretch = Default::default();
+        regular.weight.0 = 400;
+        let mut thin = regular.clone();
+        thin.post_script_name = "TestChart-Thin".into();
+        thin.weight.0 = 100;
+        let mut bold = regular.clone();
+        bold.post_script_name = "TestChart-Bold".into();
+        bold.weight.0 = 700;
+        for faces in [
+            vec![thin.clone(), bold.clone(), regular.clone()],
+            vec![bold, regular, thin],
+        ] {
+            assert_eq!(
+                face_post_script_name(&faces, "Test Chart Family").as_deref(),
+                Some("TestChart-Regular")
+            );
+            assert_eq!(
+                face_post_script_name(&faces, "testchart-thin").as_deref(),
+                Some("TestChart-Thin")
+            );
+            assert_eq!(face_post_script_name(&faces, "unknown"), None);
+        }
     }
 
     #[test]
