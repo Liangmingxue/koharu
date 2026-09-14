@@ -44,6 +44,22 @@ pub fn load_source_image(scene: &Scene, page: PageId, blobs: &BlobStore) -> Resu
     blobs.load_image(&img_data.blob)
 }
 
+/// Load the image that an inpaint operation should modify.
+///
+/// Explicitly scoped edits are cumulative: once an Inpainted layer exists,
+/// the next scoped edit must build on it instead of restoring source pixels.
+pub fn load_inpaint_base_image(
+    scene: &Scene,
+    page: PageId,
+    blobs: &BlobStore,
+    prefer_existing: bool,
+) -> Result<DynamicImage> {
+    if prefer_existing && let Some((_, blob)) = find_image_node(scene, page, ImageRole::Inpainted) {
+        return blobs.load_image(&blob);
+    }
+    load_source_image(scene, page, blobs)
+}
+
 /// Find a node of `Image { role }` on `page`, if any.
 pub fn find_image_node(scene: &Scene, page: PageId, role: ImageRole) -> Option<(NodeId, BlobRef)> {
     let page = scene.page(page)?;
@@ -121,44 +137,7 @@ pub fn clip_mask_to_text_nodes(
 ) -> DynamicImage {
     let src = mask.to_luma8();
     let (width, height) = src.dimensions();
-    let mut authorization = GrayImage::new(width, height);
-    for (_, transform, text) in nodes {
-        let mut node_has_polygon = false;
-        if let Some(polygons) = text.source_line_polygons() {
-            for polygon in polygons {
-                if !polygon
-                    .iter()
-                    .flatten()
-                    .all(|coordinate| coordinate.is_finite())
-                {
-                    continue;
-                }
-                let points = polygon
-                    .iter()
-                    .map(|point| Point::new(point[0].round() as i32, point[1].round() as i32))
-                    .collect::<Vec<_>>();
-                draw_polygon_mut(&mut authorization, &points, Luma([255]));
-                node_has_polygon = true;
-            }
-        }
-        if !node_has_polygon {
-            let x0 = transform.x.floor().max(0.0).min(width as f32) as u32;
-            let y0 = transform.y.floor().max(0.0).min(height as f32) as u32;
-            let x1 = (transform.x + transform.width)
-                .ceil()
-                .max(0.0)
-                .min(width as f32) as u32;
-            let y1 = (transform.y + transform.height)
-                .ceil()
-                .max(0.0)
-                .min(height as f32) as u32;
-            for y in y0..y1 {
-                for x in x0..x1 {
-                    authorization.put_pixel(x, y, Luma([255]));
-                }
-            }
-        }
-    }
+    let mut authorization = text_node_region_mask(width, height, nodes);
     if padding > 0 {
         authorization = dilate(
             &authorization,
@@ -175,6 +154,89 @@ pub fn clip_mask_to_text_nodes(
         }
     }
     DynamicImage::ImageLuma8(clipped)
+}
+
+/// Remove every unselected OCR text polygon after mask expansion.
+pub fn exclude_unselected_text_nodes(
+    mask: &DynamicImage,
+    scene: &Scene,
+    page: PageId,
+    selected: &[(NodeId, &Transform, &TextData)],
+) -> DynamicImage {
+    let selected_ids = selected
+        .iter()
+        .map(|(id, _, _)| *id)
+        .collect::<HashSet<_>>();
+    let excluded = text_nodes(scene, page)
+        .into_iter()
+        .filter(|(id, _, _)| !selected_ids.contains(id))
+        .collect::<Vec<_>>();
+    let src = mask.to_luma8();
+    let (width, height) = src.dimensions();
+    // Fractional OCR coordinates can cover one neighboring pixel in another
+    // rasterizer (for example Pillow floors 603.904 while imageproc rounds).
+    // A one-pixel guard keeps preserve/skip text immutable across repositories.
+    let protected = dilate(
+        &text_node_region_mask(width, height, &excluded),
+        Norm::LInf,
+        1,
+    );
+    let mut clipped = src;
+    for y in 0..height {
+        for x in 0..width {
+            if protected.get_pixel(x, y).0[0] != 0 {
+                clipped.put_pixel(x, y, Luma([0]));
+            }
+        }
+    }
+    DynamicImage::ImageLuma8(clipped)
+}
+
+fn text_node_region_mask(
+    width: u32,
+    height: u32,
+    nodes: &[(NodeId, &Transform, &TextData)],
+) -> GrayImage {
+    let mut regions = GrayImage::new(width, height);
+    for (_, transform, text) in nodes {
+        let mut node_has_polygon = false;
+        if let Some(polygons) = text.source_line_polygons() {
+            for polygon in polygons {
+                if !polygon
+                    .iter()
+                    .flatten()
+                    .all(|coordinate| coordinate.is_finite())
+                {
+                    continue;
+                }
+                let points = polygon
+                    .iter()
+                    .map(|point| Point::new(point[0].round() as i32, point[1].round() as i32))
+                    .collect::<Vec<_>>();
+                draw_polygon_mut(&mut regions, &points, Luma([255]));
+                node_has_polygon = true;
+            }
+        }
+        if !node_has_polygon {
+            let center_x = transform.x + transform.width * 0.5;
+            let center_y = transform.y + transform.height * 0.5;
+            let (sin, cos) = transform.rotation_deg.to_radians().sin_cos();
+            let points = [
+                (-transform.width * 0.5, -transform.height * 0.5),
+                (transform.width * 0.5, -transform.height * 0.5),
+                (transform.width * 0.5, transform.height * 0.5),
+                (-transform.width * 0.5, transform.height * 0.5),
+            ]
+            .map(|(x, y)| {
+                Point::new(
+                    (center_x + x * cos - y * sin).round() as i32,
+                    (center_y + x * sin + y * cos).round() as i32,
+                )
+            });
+            draw_polygon_mut(&mut regions, &points, Luma([255]));
+        }
+    }
+    regions
 }
 
 /// Convert a scene `(Transform, TextData)` pair into a `koharu-ml` `TextRegion`
@@ -570,7 +632,61 @@ pub fn sort_manga_reading_order<T>(blocks: &mut [([f32; 4], T)], order: ReadingO
 #[cfg(test)]
 mod tests {
     use super::*;
-    use koharu_core::{Node, NodeKind, Page, ReadingOrder, TextData, Transform};
+    use image::Rgba;
+    use koharu_core::{ImageData, Node, NodeKind, Page, ReadingOrder, TextData, Transform};
+    use tempfile::tempdir;
+
+    #[test]
+    fn scoped_inpaint_reuses_existing_inpainted_image() {
+        let dir = tempdir().unwrap();
+        let blobs = BlobStore::open(dir.path()).unwrap();
+        let source = blobs
+            .put_raw(&DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                2,
+                2,
+                Rgba([255, 0, 0, 255]),
+            )))
+            .unwrap();
+        let inpainted = blobs
+            .put_raw(&DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                2,
+                2,
+                Rgba([0, 0, 255, 255]),
+            )))
+            .unwrap();
+        let mut scene = Scene::default();
+        let mut page = Page::new("inpaint-base", 2, 2);
+        for (role, blob) in [
+            (ImageRole::Source, source),
+            (ImageRole::Inpainted, inpainted),
+        ] {
+            let id = NodeId::new();
+            page.nodes.insert(
+                id,
+                Node {
+                    id,
+                    transform: Transform::default(),
+                    visible: true,
+                    kind: NodeKind::Image(ImageData {
+                        role,
+                        blob,
+                        opacity: 1.0,
+                        natural_width: 2,
+                        natural_height: 2,
+                        name: None,
+                    }),
+                },
+            );
+        }
+        let page_id = page.id;
+        scene.pages.insert(page_id, page);
+
+        let scoped = load_inpaint_base_image(&scene, page_id, &blobs, true).unwrap();
+        let unscoped = load_inpaint_base_image(&scene, page_id, &blobs, false).unwrap();
+
+        assert_eq!(scoped.to_rgba8().get_pixel(0, 0), &Rgba([0, 0, 255, 255]));
+        assert_eq!(unscoped.to_rgba8().get_pixel(0, 0), &Rgba([255, 0, 0, 255]));
+    }
 
     #[test]
     fn test_reading_order_sort() {
@@ -634,5 +750,135 @@ mod tests {
         assert_eq!(clipped.get_pixel(2, 4).0[0], 0);
         assert_eq!(clipped.get_pixel(28, 8).0[0], 0);
         assert!(text_nodes_in_scope(&scene, page_id, Some(&[NodeId::new()])).is_err());
+    }
+
+    #[test]
+    fn preserved_text_is_removed_from_padded_scope() {
+        let mut scene = Scene::default();
+        let mut page = Page::new("adjacent", 24, 16);
+        let selected = NodeId::new();
+        let preserved = NodeId::new();
+        let selected_text = TextData {
+            line_polygons: Some(vec![[[2.0, 4.0], [10.0, 4.0], [10.0, 12.0], [2.0, 12.0]]]),
+            ..TextData::default()
+        };
+        let preserved_text = TextData {
+            line_polygons: Some(vec![[[11.0, 4.0], [18.0, 4.0], [18.0, 12.0], [11.0, 12.0]]]),
+            ..TextData::default()
+        };
+        for (id, text) in [(selected, selected_text), (preserved, preserved_text)] {
+            page.nodes.insert(
+                id,
+                Node {
+                    id,
+                    transform: Transform::default(),
+                    visible: true,
+                    kind: NodeKind::Text(text),
+                },
+            );
+        }
+        let page_id = page.id;
+        scene.pages.insert(page_id, page);
+        let selected_nodes = text_nodes_in_scope(&scene, page_id, Some(&[selected])).unwrap();
+        let mask = DynamicImage::ImageLuma8(GrayImage::from_pixel(24, 16, Luma([255])));
+
+        let padded = clip_mask_to_text_nodes(&mask, &selected_nodes, 4);
+        let protected =
+            exclude_unselected_text_nodes(&padded, &scene, page_id, &selected_nodes).to_luma8();
+
+        assert_eq!(protected.get_pixel(9, 8).0[0], 255);
+        assert_eq!(protected.get_pixel(10, 8).0[0], 0);
+        assert_eq!(protected.get_pixel(11, 8).0[0], 0);
+    }
+
+    #[test]
+    fn fractional_preserved_polygon_protects_neighboring_raster_boundary() {
+        let mut scene = Scene::default();
+        let mut page = Page::new("fractional", 24, 16);
+        let selected = NodeId::new();
+        let preserved = NodeId::new();
+        for (id, polygon) in [
+            (
+                selected,
+                [[2.0, 4.0], [10.0, 4.0], [10.0, 12.0], [2.0, 12.0]],
+            ),
+            (
+                preserved,
+                [[11.9, 4.1], [18.2, 4.1], [18.2, 12.1], [11.9, 12.1]],
+            ),
+        ] {
+            page.nodes.insert(
+                id,
+                Node {
+                    id,
+                    transform: Transform::default(),
+                    visible: true,
+                    kind: NodeKind::Text(TextData {
+                        line_polygons: Some(vec![polygon]),
+                        ..TextData::default()
+                    }),
+                },
+            );
+        }
+        let page_id = page.id;
+        scene.pages.insert(page_id, page);
+        let selected_nodes = text_nodes_in_scope(&scene, page_id, Some(&[selected])).unwrap();
+        let mask = DynamicImage::ImageLuma8(GrayImage::from_pixel(24, 16, Luma([255])));
+
+        let protected =
+            exclude_unselected_text_nodes(&mask, &scene, page_id, &selected_nodes).to_luma8();
+
+        assert_eq!(protected.get_pixel(10, 8).0[0], 255);
+        assert_eq!(protected.get_pixel(11, 8).0[0], 0);
+    }
+
+    #[test]
+    fn rotated_legacy_text_is_removed_from_padded_scope() {
+        let mut scene = Scene::default();
+        let mut page = Page::new("rotated", 24, 20);
+        let selected = NodeId::new();
+        let preserved = NodeId::new();
+        for (id, transform) in [
+            (
+                selected,
+                Transform {
+                    x: 2.0,
+                    y: 6.0,
+                    width: 6.0,
+                    height: 6.0,
+                    rotation_deg: 0.0,
+                },
+            ),
+            (
+                preserved,
+                Transform {
+                    x: 12.0,
+                    y: 4.0,
+                    width: 4.0,
+                    height: 12.0,
+                    rotation_deg: 90.0,
+                },
+            ),
+        ] {
+            page.nodes.insert(
+                id,
+                Node {
+                    id,
+                    transform,
+                    visible: true,
+                    kind: NodeKind::Text(TextData::default()),
+                },
+            );
+        }
+        let page_id = page.id;
+        scene.pages.insert(page_id, page);
+        let selected_nodes = text_nodes_in_scope(&scene, page_id, Some(&[selected])).unwrap();
+        let mask = DynamicImage::ImageLuma8(GrayImage::from_pixel(24, 20, Luma([255])));
+
+        let padded = clip_mask_to_text_nodes(&mask, &selected_nodes, 4);
+        let protected =
+            exclude_unselected_text_nodes(&padded, &scene, page_id, &selected_nodes).to_luma8();
+
+        assert_eq!(protected.get_pixel(10, 10).0[0], 0);
     }
 }

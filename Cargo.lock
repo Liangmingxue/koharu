@@ -4409,6 +4409,7 @@ version = "0.61.2"
 dependencies = [
  "anyhow",
  "async-stream",
+ "atomicwrites",
  "axum",
  "blake3",
  "camino",
@@ -4427,6 +4428,7 @@ dependencies = [
  "schemars 1.2.1",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-stream",

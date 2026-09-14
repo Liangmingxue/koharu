@@ -84,7 +84,7 @@ fn step_for(info: &EngineInfo) -> Option<PipelineStep> {
 
 use crate::llm;
 use crate::renderer;
-use crate::session::ProjectSession;
+use crate::session::{ProjectSession, SceneEpochMismatch};
 
 // ---------------------------------------------------------------------------
 // Spec + scope
@@ -95,6 +95,9 @@ pub struct PipelineSpec {
     pub scope: Scope,
     pub steps: Vec<String>,
     pub options: PipelineRunOptions,
+    /// Scene epoch used to build the first engine snapshot. Every mutating
+    /// step advances this value through a compare-and-swap apply.
+    pub expected_epoch: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +132,15 @@ pub async fn run(
     progress: Option<ProgressSink>,
     warnings: Option<WarningSink>,
 ) -> Result<RunOutcome> {
+    let mut expected_epoch = spec.expected_epoch;
+    let actual_epoch = session.epoch();
+    if actual_epoch != expected_epoch {
+        return Err(SceneEpochMismatch {
+            expected: expected_epoch,
+            actual: actual_epoch,
+        }
+        .into());
+    }
     let infos: Vec<&EngineInfo> = spec
         .steps
         .iter()
@@ -243,7 +255,12 @@ pub async fn run(
                 ops,
                 label: format!("{}: page {}", info.id, page_id),
             };
-            if let Err(err) = session.apply(batch) {
+            if let Err(err) = apply_pipeline_batch(&session, &mut expected_epoch, batch) {
+                // A stale snapshot is a pipeline-level conflict, not a model
+                // warning: continuing could mix effects from two writers.
+                if err.downcast_ref::<SceneEpochMismatch>().is_some() {
+                    return Err(err);
+                }
                 report_step_failure(
                     info.id,
                     page_id,
@@ -272,6 +289,15 @@ pub async fn run(
         });
     }
     Ok(RunOutcome { warning_count })
+}
+
+fn apply_pipeline_batch(
+    session: &ProjectSession,
+    expected_epoch: &mut u64,
+    batch: Op,
+) -> Result<()> {
+    *expected_epoch = session.apply_if_epoch(*expected_epoch, batch)?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -356,6 +382,7 @@ pub fn catalog() -> EngineCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use koharu_core::ProjectMetaPatch;
 
     #[test]
     fn catalog_includes_anime_text_detector() {
@@ -366,5 +393,27 @@ mod tests {
                 && engine.name == "Anime Text YOLO (N)"
                 && engine.produces.iter().map(String::as_str).eq(["TextBoxes"])
         }));
+    }
+
+    #[test]
+    fn pipeline_batch_rejects_a_stale_scene_epoch() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = ProjectSession::create(
+            camino::Utf8PathBuf::from_path_buf(temp.path().join("cas.khrproj")).unwrap(),
+            "CAS",
+        )
+        .unwrap();
+        let op = || Op::UpdateProjectMeta {
+            patch: ProjectMetaPatch::default(),
+            prev: ProjectMetaPatch::default(),
+        };
+        let mut expected = 0;
+        session.apply(op()).unwrap();
+
+        let error = apply_pipeline_batch(&session, &mut expected, op()).unwrap_err();
+
+        assert!(error.to_string().contains("scene epoch mismatch"));
+        assert_eq!(expected, 0);
+        assert_eq!(session.epoch(), 1);
     }
 }

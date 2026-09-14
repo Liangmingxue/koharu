@@ -12,10 +12,12 @@
 pub mod api;
 pub mod binary;
 pub mod bootstrap;
+mod durable_json;
 pub mod error;
 pub mod events;
 pub mod idempotency;
 pub mod mcp;
+pub mod operation_journal;
 pub mod psd_export;
 pub mod routes;
 pub mod server;
@@ -25,6 +27,7 @@ use std::sync::Arc;
 pub use api::{ApiState, api, router};
 pub use bootstrap::BootstrapManager;
 pub use error::{ApiError, ApiResult};
+pub use routes::chart_agent::ChartAgentCapabilitiesV1;
 
 /// Concrete state threaded through every `State<ApiState>` extractor.
 pub type AppState = Arc<BootstrapManager>;

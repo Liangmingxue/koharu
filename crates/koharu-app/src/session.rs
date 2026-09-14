@@ -188,9 +188,12 @@ impl ProjectSession {
     /// Write a new snapshot (scene.bin) and truncate the log. Safe to call
     /// at any time; crash mid-compaction leaves the old snapshot + full log.
     pub fn compact(&self) -> Result<()> {
+        // Serialize writes through snapshot publication and log truncation.
+        // Releasing history earlier could discard operations newer than snap.
+        let mut history = self.history.lock();
         let snap = {
             let scene = self.scene.read();
-            let epoch = self.history.lock().epoch();
+            let epoch = history.epoch();
             Snapshot {
                 epoch,
                 scene: scene.clone(),
@@ -201,10 +204,15 @@ impl ProjectSession {
             self.dir.join(SCENE_FILE).as_std_path(),
             OverwriteBehavior::AllowOverwrite,
         )
-        .write(|f| f.write_all(&bytes))
+        .write(|f| {
+            f.write_all(&bytes)?;
+            f.sync_all()
+        })
         .context("write scene.bin atomically")?;
+        #[cfg(unix)]
+        File::open(self.dir.as_std_path())?.sync_all()?;
         // Log truncation only after snapshot is durably on disk.
-        self.history.lock().truncate_log()?;
+        history.truncate_log()?;
         Ok(())
     }
 }

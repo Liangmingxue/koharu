@@ -23,8 +23,30 @@ use uuid::Uuid;
 
 use crate::AppState;
 use crate::error::{ApiError, ApiResult};
-use crate::idempotency::{complete_json, replay_json, request_hash};
+use crate::idempotency::{complete_json, fail_json, replay_json, request_hash};
+use crate::operation_journal::OperationJournal;
+use crate::routes::history::{map_apply_error, parse_epoch_precondition};
 use crate::routes::operations::{register_cancel, unregister_cancel};
+
+#[cfg(test)]
+mod tests {
+    use axum::http::{HeaderMap, HeaderValue, header::IF_MATCH};
+
+    use super::required_epoch_precondition;
+
+    #[test]
+    fn pipeline_requires_a_scene_epoch_precondition() {
+        assert_eq!(
+            required_epoch_precondition(&HeaderMap::new())
+                .unwrap_err()
+                .status,
+            428
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(IF_MATCH, HeaderValue::from_static("\"17\""));
+        assert_eq!(required_epoch_precondition(&headers).unwrap(), 17);
+    }
+}
 
 pub fn router() -> OpenApiRouter<AppState> {
     OpenApiRouter::default().routes(routes!(start_pipeline))
@@ -67,14 +89,20 @@ pub struct StartPipelineResponse {
 #[utoipa::path(
     post,
     path = "/pipelines",
+    params(("If-Match" = String, Header, description = "Quoted or unquoted expected scene epoch")),
     request_body = StartPipelineRequest,
-    responses((status = 200, body = StartPipelineResponse))
+    responses(
+        (status = 200, body = StartPipelineResponse),
+        (status = 412, description = "Scene epoch differs from If-Match"),
+        (status = 428, description = "If-Match is required")
+    )
 )]
 async fn start_pipeline(
     State(app): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<StartPipelineRequest>,
 ) -> ApiResult<Json<StartPipelineResponse>> {
+    let expected_epoch = required_epoch_precondition(&headers)?;
     let session = app
         .current_session()
         .ok_or_else(|| ApiError::bad_request("no project open"))?;
@@ -101,14 +129,29 @@ async fn start_pipeline(
         ));
     }
     let config = (**app.config.load()).clone();
+    let pipeline_request_hash = request_hash(
+        "POST /pipelines",
+        &(session.dir.as_str(), expected_epoch, &req),
+    )?;
     let decision = app.idempotency().begin(
         &config.data.path,
         &headers,
         "POST /pipelines",
-        request_hash("POST /pipelines", &(session.dir.as_str(), &req))?,
+        pipeline_request_hash.clone(),
     )?;
     if let Some(response) = replay_json::<StartPipelineResponse>(&decision)? {
         return Ok(Json(response));
+    }
+    let actual_epoch = session.epoch();
+    if actual_epoch != expected_epoch {
+        let error = map_apply_error(
+            koharu_app::session::SceneEpochMismatch {
+                expected: expected_epoch,
+                actual: actual_epoch,
+            }
+            .into(),
+        );
+        return Err(fail_json(app.idempotency(), decision, error));
     }
     let spec = PipelineSpec {
         scope: match req.pages {
@@ -126,27 +169,54 @@ async fn start_pipeline(
             seed: req.seed,
             engine_config: req.engine_config,
         },
+        expected_epoch,
     };
 
     let operation_id = Uuid::new_v4().to_string();
-    let cancel = Arc::new(AtomicBool::new(false));
-    register_cancel(operation_id.clone(), cancel.clone());
-    app.jobs.insert(
-        operation_id.clone(),
-        JobSummary {
-            id: operation_id.clone(),
-            kind: "pipeline".to_string(),
-            status: JobStatus::Running,
-            error: None,
-        },
-    );
+    let running = JobSummary {
+        id: operation_id.clone(),
+        kind: "pipeline".to_string(),
+        status: JobStatus::Running,
+        error: None,
+    };
+    let journal = OperationJournal::default();
+    if let Err(error) = journal.record_running(
+        &config.data.path,
+        session.dir.as_str(),
+        &pipeline_request_hash,
+        &running,
+    ) {
+        return Err(fail_json(
+            app.idempotency(),
+            decision,
+            ApiError::internal(error),
+        ));
+    }
+
+    let response = StartPipelineResponse {
+        operation_id: operation_id.clone(),
+    };
+    if let Err(error) = complete_json(app.idempotency(), decision, &response) {
+        let _ = journal.record_terminal(
+            &config.data.path,
+            &operation_id,
+            JobStatus::Failed,
+            Some(error.message.clone()),
+        );
+        app.jobs.remove(&operation_id);
+        return Err(error);
+    }
+    app.jobs.insert(operation_id.clone(), running);
     app.bus.publish(AppEvent::JobStarted {
         id: operation_id.clone(),
         kind: "pipeline".to_string(),
     });
 
-    // Detach the pipeline. Progress writes directly into the jobs registry;
-    // clients observe via SSE.
+    // The accepted operation and its receipt are durable before it is
+    // detached. On restart, a still-running record becomes an explicit
+    // failure instead of disappearing from `/operations`.
+    let cancel = Arc::new(AtomicBool::new(false));
+    register_cancel(operation_id.clone(), cancel.clone());
     let app_c = app.clone();
     let session_c = session.clone();
     let op_id_c = operation_id.clone();
@@ -155,6 +225,7 @@ async fn start_pipeline(
     let llm_c = app.llm.clone();
     let renderer_c = app.renderer.clone();
     let cpu = app.cpu_only();
+    let data_root_c = config.data.path.clone();
     let progress_bus = app.bus.clone();
     let progress_op_id = operation_id.clone();
     let progress_sink: pipeline::ProgressSink = Arc::new(move |tick: ProgressTick| {
@@ -209,15 +280,17 @@ async fn start_pipeline(
                 (JobStatus::Failed, Some(format!("{e:#}")))
             }
         };
-        app_c.jobs.insert(
-            op_id_c.clone(),
-            JobSummary {
+        let terminal = OperationJournal::default()
+            .record_terminal(&data_root_c, &op_id_c, status, error.clone())
+            .unwrap_or_else(|journal_error| JobSummary {
                 id: op_id_c.clone(),
                 kind: "pipeline".to_string(),
-                status,
-                error: error.clone(),
-            },
-        );
+                status: JobStatus::Failed,
+                error: Some(format!("persist terminal operation: {journal_error:#}")),
+            });
+        let status = terminal.status;
+        let error = terminal.error.clone();
+        app_c.jobs.insert(op_id_c.clone(), terminal);
         app_c.bus.publish(AppEvent::JobFinished(JobFinishedEvent {
             id: op_id_c.clone(),
             status,
@@ -226,7 +299,14 @@ async fn start_pipeline(
         unregister_cancel(&op_id_c);
     });
 
-    let response = StartPipelineResponse { operation_id };
-    complete_json(app.idempotency(), decision, &response)?;
     Ok(Json(response))
+}
+
+fn required_epoch_precondition(headers: &HeaderMap) -> ApiResult<u64> {
+    parse_epoch_precondition(headers)?.ok_or_else(|| {
+        ApiError::new(
+            axum::http::StatusCode::PRECONDITION_REQUIRED,
+            "POST /pipelines requires If-Match with the expected scene epoch",
+        )
+    })
 }

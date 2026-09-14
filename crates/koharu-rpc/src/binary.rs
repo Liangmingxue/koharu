@@ -41,8 +41,12 @@ async fn get_scene_json(State(app): State<AppState>) -> ApiResult<Json<SceneSnap
     let session = app
         .current_session()
         .ok_or_else(|| ApiError::bad_request("no project open"))?;
-    let scene = session.scene.read().clone();
-    let epoch = session.epoch();
+    // Match writers' history -> scene lock order and bind epoch to this scene.
+    let (epoch, scene) = {
+        let history = session.history.lock();
+        let scene = session.scene.read();
+        (history.epoch(), scene.clone())
+    };
     Ok(Json(SceneSnapshot { epoch, scene }))
 }
 
@@ -62,8 +66,9 @@ async fn get_scene_bin(State(app): State<AppState>) -> ApiResult<Response> {
         .current_session()
         .ok_or_else(|| ApiError::bad_request("no project open"))?;
     let (epoch, bytes) = {
+        let history = session.history.lock();
         let scene = session.scene.read();
-        let epoch = session.epoch();
+        let epoch = history.epoch();
         let bytes = postcard::to_allocvec(&WireSnapshot {
             epoch,
             scene: &scene,

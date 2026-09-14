@@ -261,10 +261,36 @@ pub(crate) async fn ensure_ready(runtime: &Runtime) -> Result<()> {
 
     add_runtime_search_path(&install_dir)?;
     for library in distribution.libraries() {
-        preload_library(&install_dir.join(library))?;
+        if should_preload_library(library, runtime.wants_gpu()) {
+            preload_library(&install_dir.join(library))?;
+        }
     }
 
     Ok(())
+}
+
+fn should_preload_library(library: &str, _wants_gpu: bool) -> bool {
+    // Backend plugins are selected and loaded exactly once by koharu-llm.
+    // Runtime preparation owns only the common libraries both policies need.
+    matches!(
+        library.to_ascii_lowercase().as_str(),
+        // Linux common dependencies.
+        "libggml-base.so"
+            | "libggml.so"
+            | "libllama.so"
+            | "libmtmd.so"
+            // Windows common dependencies.
+            | "libomp140.x86_64.dll"
+            | "ggml-base.dll"
+            | "ggml.dll"
+            | "llama.dll"
+            | "mtmd.dll"
+            // macOS common dependencies.
+            | "libggml-base.dylib"
+            | "libggml.dylib"
+            | "libllama.dylib"
+            | "libmtmd.dylib"
+    )
 }
 
 pub(crate) fn runtime_dir(runtime: &Runtime) -> Result<PathBuf> {
@@ -330,6 +356,73 @@ mod tests {
             .collect();
         assert!(paths.iter().all(|path| path.exists()));
         assert_eq!(paths.len(), runtime.libraries().len());
+    }
+
+    #[test]
+    fn cpu_preload_is_an_explicit_cross_platform_common_dependency_allowlist() {
+        let cases = [
+            // Linux common dependencies.
+            ("libggml-base.so", true),
+            ("libggml.so", true),
+            ("libllama.so", true),
+            ("libmtmd.so", true),
+            // Windows common dependencies.
+            ("libomp140.x86_64.dll", true),
+            ("ggml-base.dll", true),
+            ("ggml.dll", true),
+            ("llama.dll", true),
+            ("mtmd.dll", true),
+            // macOS common dependencies.
+            ("libggml-base.dylib", true),
+            ("libggml.dylib", true),
+            ("libllama.dylib", true),
+            ("libmtmd.dylib", true),
+            // Backend plugins stay owned by koharu-llm.
+            ("libggml-cpu-alderlake.so", false),
+            ("ggml-cpu-haswell.dll", false),
+            ("libggml-cpu.dylib", false),
+            ("libggml-cuda.so", false),
+            ("ggml-vulkan.dll", false),
+            ("libggml-metal.dylib", false),
+            ("libggml-rpc.so", false),
+            ("ggml-rpc.dll", false),
+            ("libggml-rpc.dylib", false),
+            ("libggml-blas.dylib", false),
+            ("libggml-future-backend.so", false),
+        ];
+
+        for (library, expected) in cases {
+            assert_eq!(
+                should_preload_library(library, false),
+                expected,
+                "unexpected CPU preload policy for {library}"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_preload_keeps_common_dependencies_and_leaves_plugins_to_load_all() {
+        let cases = [
+            ("libggml-base.so", true),
+            ("libggml.so", true),
+            ("libllama.so", true),
+            ("libmtmd.so", true),
+            ("libomp140.x86_64.dll", true),
+            ("libggml-cpu-alderlake.so", false),
+            ("libggml-vulkan.so", false),
+            ("libggml-rpc.so", false),
+            ("libggml-blas.dylib", false),
+            ("libggml-future-backend.so", false),
+            ("cudart64_13.dll", false),
+        ];
+
+        for (library, expected) in cases {
+            assert_eq!(
+                should_preload_library(library, true),
+                expected,
+                "unexpected GPU preload ownership for {library}"
+            );
+        }
     }
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]

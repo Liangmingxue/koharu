@@ -34,6 +34,12 @@ expression: paths
         ],
     ),
     (
+        "/chart-agent/capabilities",
+        [
+            "get",
+        ],
+    ),
+    (
         "/config",
         [
             "get",
@@ -106,6 +112,12 @@ expression: paths
         "/history/undo",
         [
             "post",
+        ],
+    ),
+    (
+        "/idempotency/receipt",
+        [
+            "get",
         ],
     ),
     (

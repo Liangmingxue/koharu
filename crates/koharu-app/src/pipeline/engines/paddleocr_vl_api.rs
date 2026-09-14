@@ -5,7 +5,7 @@ use std::io::Cursor;
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use base64::Engine as _;
-use image::ImageFormat;
+use image::{DynamicImage, ImageFormat};
 use koharu_core::{
     DetectorEvidence, LineDetectorEvidence, Op, SOURCE_GEOMETRY_EVIDENCE_VERSION,
     SourceGeometryEvidence, TextData, TextDirection,
@@ -22,7 +22,7 @@ use crate::pipeline::engines::support::{
 };
 
 const ENGINE_ID: &str = "paddleocr-vl-spotting-api";
-const ENGINE_VERSION: &str = "paddleocr-vl-spotting-api.v1";
+const ENGINE_VERSION: &str = "paddleocr-vl-spotting-api.v2";
 const DIRECTION_SOURCE: &str = "koharu.polygon-long-axis.v1";
 const ENDPOINT_ENV: &str = "PADDLEOCR_VL_API_URL";
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:8080/layout-parsing";
@@ -46,13 +46,8 @@ impl Model {
             config_hash,
         }
     }
-}
 
-#[async_trait]
-impl Engine for Model {
-    async fn run(&self, ctx: EngineCtx<'_>) -> Result<Vec<Op>> {
-        let image = load_source_image(ctx.scene, ctx.page, ctx.blobs)?;
-        let (source_width, source_height) = (image.width(), image.height());
+    async fn spot(&self, image: &DynamicImage) -> Result<ApiResponse> {
         let mut png = Cursor::new(Vec::new());
         image
             .write_to(&mut png, ImageFormat::Png)
@@ -71,11 +66,34 @@ impl Engine for Model {
             status.is_success(),
             "PaddleOCR-VL returned HTTP status {status}"
         );
-        let response: ApiResponse = response
+        response
             .json()
             .await
-            .context("failed to decode PaddleOCR-VL response")?;
-        let mut pairs = response.into_text_pairs(source_width, source_height, &self.config_hash)?;
+            .context("failed to decode PaddleOCR-VL response")
+    }
+}
+
+#[async_trait]
+impl Engine for Model {
+    async fn run(&self, ctx: EngineCtx<'_>) -> Result<Vec<Op>> {
+        let image = load_source_image(ctx.scene, ctx.page, ctx.blobs)?;
+        let (source_width, source_height) = (image.width(), image.height());
+        let mut pairs = self.spot(&image).await?.into_text_pairs(
+            source_width,
+            source_height,
+            &self.config_hash,
+        )?;
+
+        // A single clockwise pass turns common 90-degree chart axes into
+        // horizontal lines. Only those horizontal rotated observations are
+        // mapped back, so normal source text is not recognized twice.
+        let rotated = image.rotate90();
+        pairs.extend(self.spot(&rotated).await?.into_clockwise_text_pairs(
+            source_width,
+            source_height,
+            &self.config_hash,
+        )?);
+        let mut pairs = deduplicate_pairs(pairs);
         sort_manga_reading_order(&mut pairs, ctx.options.reading_order.unwrap_or_default());
 
         let mut ops = clear_text_nodes_ops(ctx.scene, ctx.page);
@@ -126,6 +144,7 @@ struct DetectorConfig<'a> {
     prompt_label: &'static str,
     format_block_content: bool,
     visualize: bool,
+    clockwise_fallback_pass: bool,
 }
 
 fn detector_config_hash(endpoint: &str) -> String {
@@ -136,6 +155,7 @@ fn detector_config_hash(endpoint: &str) -> String {
         prompt_label: "spotting",
         format_block_content: false,
         visualize: false,
+        clockwise_fallback_pass: true,
     };
     let bytes = serde_json::to_vec(&config).expect("detector config is serializable");
     let digest = Sha256::digest(bytes);
@@ -156,12 +176,7 @@ struct ApiResponse {
 }
 
 impl ApiResponse {
-    fn into_text_pairs(
-        self,
-        source_width: u32,
-        source_height: u32,
-        config_hash: &str,
-    ) -> Result<Vec<([f32; 4], TextData)>> {
+    fn into_spotting_result(self) -> Result<SpottingResult> {
         if self.error_code != 0 {
             bail!("PaddleOCR-VL error {}: {}", self.error_code, self.error_msg);
         }
@@ -175,7 +190,28 @@ impl ApiResponse {
             .pruned_result
             .spotting_res
             .context("PaddleOCR-VL response has no spotting result")?;
-        spotting.into_text_pairs(source_width, source_height, config_hash)
+        Ok(spotting)
+    }
+
+    fn into_text_pairs(
+        self,
+        source_width: u32,
+        source_height: u32,
+        config_hash: &str,
+    ) -> Result<Vec<([f32; 4], TextData)>> {
+        self.into_spotting_result()?
+            .into_text_pairs(source_width, source_height, config_hash)
+    }
+
+    fn into_clockwise_text_pairs(
+        self,
+        source_width: u32,
+        source_height: u32,
+        config_hash: &str,
+    ) -> Result<Vec<([f32; 4], TextData)>> {
+        self.into_spotting_result()?
+            .restore_clockwise_horizontal_lines(source_height)?
+            .into_text_pairs(source_width, source_height, config_hash)
     }
 }
 
@@ -205,6 +241,52 @@ struct SpottingResult {
 }
 
 impl SpottingResult {
+    fn restore_clockwise_horizontal_lines(self, source_height: u32) -> Result<Self> {
+        ensure!(
+            self.rec_polys.len() == self.rec_texts.len(),
+            "PaddleOCR-VL returned {} polygons but {} texts",
+            self.rec_polys.len(),
+            self.rec_texts.len()
+        );
+        if let Some(scores) = &self.rec_scores {
+            ensure!(
+                scores.len() == self.rec_texts.len(),
+                "PaddleOCR-VL returned {} scores but {} texts",
+                scores.len(),
+                self.rec_texts.len()
+            );
+        }
+
+        let mut polygons = Vec::new();
+        let mut texts = Vec::new();
+        let mut scores = self.rec_scores.as_ref().map(|_| Vec::new());
+        for (index, (points, text)) in self.rec_polys.into_iter().zip(self.rec_texts).enumerate() {
+            let polygon: [[f32; 2]; 4] = points.try_into().map_err(|points: Vec<_>| {
+                anyhow::anyhow!(
+                    "PaddleOCR-VL polygon {index} has {} points; expected 4",
+                    points.len()
+                )
+            })?;
+            if text_pose(&polygon, &text).direction != TextDirection::Horizontal {
+                continue;
+            }
+            polygons.push(
+                restore_clockwise_polygon(polygon, source_height)
+                    .into_iter()
+                    .collect(),
+            );
+            texts.push(text);
+            if let (Some(source), Some(target)) = (&self.rec_scores, &mut scores) {
+                target.push(source[index]);
+            }
+        }
+        Ok(Self {
+            rec_polys: polygons,
+            rec_texts: texts,
+            rec_scores: scores,
+        })
+    }
+
     fn into_text_pairs(
         self,
         source_width: u32,
@@ -300,6 +382,56 @@ impl SpottingResult {
             })
             .collect()
     }
+}
+
+fn restore_clockwise_polygon(polygon: [[f32; 2]; 4], source_height: u32) -> [[f32; 2]; 4] {
+    polygon.map(|[x, y]| [y, source_height as f32 - x])
+}
+
+fn normalized_text_key(text: &str) -> String {
+    text.chars()
+        .filter(|character| !character.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn overlap_over_smaller(left: [f32; 4], right: [f32; 4]) -> f32 {
+    let width = (left[2].min(right[2]) - left[0].max(right[0])).max(0.0);
+    let height = (left[3].min(right[3]) - left[1].max(right[1])).max(0.0);
+    let intersection = width * height;
+    let left_area = (left[2] - left[0]) * (left[3] - left[1]);
+    let right_area = (right[2] - right[0]) * (right[3] - right[1]);
+    intersection / left_area.min(right_area).max(f32::EPSILON)
+}
+
+fn pair_rank(pair: &([f32; 4], TextData)) -> (i32, i64) {
+    let confidence = pair
+        .1
+        .source_geometry
+        .as_ref()
+        .and_then(|geometry| geometry.detector_evidence.line_evidence.first())
+        .and_then(|line| line.text_confidence)
+        .map(|value| (value * 1_000_000.0).round() as i32)
+        .unwrap_or(-1);
+    let area = ((pair.0[2] - pair.0[0]) * (pair.0[3] - pair.0[1]) * 1_000.0).round() as i64;
+    (confidence, area)
+}
+
+fn deduplicate_pairs(pairs: Vec<([f32; 4], TextData)>) -> Vec<([f32; 4], TextData)> {
+    let mut result: Vec<([f32; 4], TextData)> = Vec::new();
+    for pair in pairs {
+        let key = normalized_text_key(pair.1.text.as_deref().unwrap_or_default());
+        let duplicate = result.iter().position(|existing| {
+            normalized_text_key(existing.1.text.as_deref().unwrap_or_default()) == key
+                && overlap_over_smaller(existing.0, pair.0) >= 0.8
+        });
+        match duplicate {
+            Some(index) if pair_rank(&pair) > pair_rank(&result[index]) => result[index] = pair,
+            Some(_) => {}
+            None => result.push(pair),
+        }
+    }
+    result
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -555,5 +687,34 @@ mod tests {
         assert_eq!(detector.block_polygon_confidence, None);
         assert_eq!(detector.direction_confidence, None);
         assert_eq!(detector.rotation_confidence, None);
+    }
+
+    #[test]
+    fn maps_clockwise_pass_polygons_back_to_source_coordinates() {
+        let rotated = [[60.0, 10.0], [60.0, 40.0], [50.0, 40.0], [50.0, 10.0]];
+
+        assert_eq!(
+            restore_clockwise_polygon(rotated, 80),
+            [[10.0, 20.0], [40.0, 20.0], [40.0, 30.0], [10.0, 30.0]]
+        );
+    }
+
+    #[test]
+    fn removes_only_overlapping_normalized_text_duplicates() {
+        let pairs = into_pairs(response(
+            r#"[
+                [[10,20],[70,20],[70,30],[10,30]],
+                [[11,20],[71,20],[71,30],[11,30]],
+                [[10,50],[70,50],[70,60],[10,60]]
+            ]"#,
+            r#"["Growth Rate (%)","Growth Rate(%)","Growth Rate (%)"]"#,
+        ))
+        .unwrap();
+
+        let pairs = deduplicate_pairs(pairs);
+
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].1.text.as_deref(), Some("Growth Rate (%)"));
+        assert_eq!(pairs[1].0, [10.0, 50.0, 70.0, 60.0]);
     }
 }

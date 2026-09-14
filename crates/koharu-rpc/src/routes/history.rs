@@ -11,14 +11,14 @@
 use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
-use koharu_app::session::SceneEpochMismatch;
+use koharu_app::session::{ProjectSession, SceneEpochMismatch};
 use koharu_core::Op;
 use serde::{Deserialize, Serialize};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::AppState;
 use crate::error::{ApiError, ApiResult};
-use crate::idempotency::{complete_json, replay_json, request_hash};
+use crate::idempotency::{complete_json, fail_json, replay_json, request_hash};
 
 pub fn router() -> OpenApiRouter<AppState> {
     OpenApiRouter::default()
@@ -29,8 +29,12 @@ pub fn router() -> OpenApiRouter<AppState> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_epoch_precondition;
+    use super::{apply_to_session, history_request_hash, parse_epoch_precondition};
     use axum::http::{HeaderMap, HeaderValue, header::IF_MATCH};
+    use koharu_app::ProjectSession;
+    use koharu_core::Op;
+
+    use crate::idempotency::{Decision, IdempotencyStore, complete_json};
 
     fn headers(value: &'static str) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -55,6 +59,47 @@ mod tests {
                 "{value}"
             );
         }
+    }
+
+    #[test]
+    fn history_receipt_conflicts_across_sessions_and_mutation_stays_pinned() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_root = camino::Utf8Path::from_path(temp.path()).unwrap();
+        let session_a = ProjectSession::create(
+            camino::Utf8PathBuf::from_path_buf(temp.path().join("a.khrproj")).unwrap(),
+            "A",
+        )
+        .unwrap();
+        let session_b = ProjectSession::create(
+            camino::Utf8PathBuf::from_path_buf(temp.path().join("b.khrproj")).unwrap(),
+            "B",
+        )
+        .unwrap();
+        let op = Op::UpdateProjectMeta {
+            patch: Default::default(),
+            prev: Default::default(),
+        };
+        let expected = Some(0);
+        let hash_a = history_request_hash(&session_a, expected, &op).unwrap();
+        let hash_b = history_request_hash(&session_b, expected, &op).unwrap();
+        assert_ne!(hash_a, hash_b);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", HeaderValue::from_static("request-1"));
+        let store = IdempotencyStore::default();
+        let decision = store
+            .begin(data_root, &headers, "POST /history/apply", hash_a)
+            .unwrap();
+        assert!(matches!(decision, Decision::Fresh(_)));
+        complete_json(&store, decision, &serde_json::json!({"epoch": 1})).unwrap();
+        let conflict = store
+            .begin(data_root, &headers, "POST /history/apply", hash_b)
+            .unwrap_err();
+        assert_eq!(conflict.status, 409);
+
+        assert_eq!(apply_to_session(&session_a, expected, op).unwrap(), 1);
+        assert_eq!(session_a.epoch(), 1);
+        assert_eq!(session_b.epoch(), 0);
     }
 }
 
@@ -82,23 +127,45 @@ async fn apply_command(
     Json(op): Json<Op>,
 ) -> ApiResult<Json<HistoryResult>> {
     let expected = parse_epoch_precondition(&headers)?;
+    let session = app
+        .current_session()
+        .ok_or_else(|| ApiError::bad_request("no project open"))?;
     let config = (**app.config.load()).clone();
     let decision = app.idempotency().begin(
         &config.data.path,
         &headers,
         "POST /history/apply",
-        request_hash("POST /history/apply", &(expected, &op))?,
+        history_request_hash(&session, expected, &op)?,
     )?;
     if let Some(response) = replay_json::<HistoryResult>(&decision)? {
         return Ok(Json(response));
     }
-    let epoch = match expected {
-        Some(epoch) => app.apply_if_epoch(epoch, op).map_err(map_apply_error)?,
-        None => app.apply(op).map_err(ApiError::internal)?,
+    let epoch = match apply_to_session(&session, expected, op).map_err(map_apply_error) {
+        Ok(epoch) => epoch,
+        Err(error) => return Err(fail_json(app.idempotency(), decision, error)),
     };
     let response = HistoryResult { epoch: Some(epoch) };
     complete_json(app.idempotency(), decision, &response)?;
     Ok(Json(response))
+}
+
+fn history_request_hash(
+    session: &ProjectSession,
+    expected: Option<u64>,
+    op: &Op,
+) -> ApiResult<String> {
+    request_hash("POST /history/apply", &(session.dir.as_str(), expected, op))
+}
+
+fn apply_to_session(
+    session: &ProjectSession,
+    expected: Option<u64>,
+    op: Op,
+) -> anyhow::Result<u64> {
+    match expected {
+        Some(epoch) => session.apply_if_epoch(epoch, op),
+        None => session.apply(op),
+    }
 }
 
 pub(crate) fn parse_epoch_precondition(headers: &HeaderMap) -> ApiResult<Option<u64>> {

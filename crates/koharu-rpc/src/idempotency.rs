@@ -1,12 +1,13 @@
 //! Durable HTTP idempotency receipts for side-effecting gateway requests.
 //!
-//! A request is first persisted as `pending`, then replaced atomically with
-//! its exact JSON response.  Completed requests replay that response.  A
-//! process crash between the effect and completion remains `pending` and is
+//! A request is first persisted as `pending`, then atomically replaced by its
+//! exact success response or a known no-effect failure. Both terminal states
+//! replay exactly. A crash with an ambiguous outcome remains `pending` and is
 //! rejected rather than executed twice.
 
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
+#[cfg(unix)]
+use std::fs::File;
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
@@ -18,9 +19,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::AppState;
+use crate::durable_json;
 use crate::error::{ApiError, ApiResult};
 
-const RECEIPT_VERSION: &str = "koharu-http-receipt.v1";
+const RECEIPT_VERSION: &str = "koharu-http-receipt.v2";
+const LEGACY_RECEIPT_VERSION: &str = "koharu-http-receipt.v1";
 const IDEMPOTENCY_HEADER: &str = "idempotency-key";
 
 pub fn router() -> utoipa_axum::router::OpenApiRouter<AppState> {
@@ -61,6 +64,8 @@ pub struct IdempotencyReceipt {
     pub request_hash: String,
     pub state: ReceiptState,
     pub response: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_status: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -68,6 +73,7 @@ pub struct IdempotencyReceipt {
 pub enum ReceiptState {
     Pending,
     Completed,
+    Failed,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +89,7 @@ pub enum Decision {
     Disabled,
     Fresh(Reservation),
     Replay(Value),
+    ReplayFailure(ApiError),
 }
 
 #[derive(Default)]
@@ -112,9 +119,7 @@ impl IdempotencyStore {
             .lock
             .lock()
             .map_err(|_| ApiError::internal(anyhow::anyhow!("idempotency lock poisoned")))?;
-        fs::create_dir_all(reservation.root.as_std_path()).map_err(|error| {
-            ApiError::internal(anyhow::Error::new(error).context("create idempotency receipt root"))
-        })?;
+        ensure_receipt_root(data_root).map_err(ApiError::internal)?;
         let path = receipt_path(&reservation.root, &reservation.key);
         if path.exists() {
             let receipt = read_receipt(&path).map_err(ApiError::internal)?;
@@ -127,9 +132,15 @@ impl IdempotencyStore {
                     "Idempotency-Key was already used for a different request",
                 ));
             }
-            return match (receipt.state, receipt.response) {
-                (ReceiptState::Completed, Some(response)) => Ok(Decision::Replay(response)),
-                (ReceiptState::Pending, None) => Err(ApiError::new(
+            return match (receipt.state, receipt.response, receipt.response_status) {
+                (ReceiptState::Completed, Some(response), _) => Ok(Decision::Replay(response)),
+                (ReceiptState::Failed, Some(response), Some(status)) => {
+                    let mut error: ApiError = serde_json::from_value(response)
+                        .map_err(|error| ApiError::internal(anyhow::Error::new(error)))?;
+                    error.status = status;
+                    Ok(Decision::ReplayFailure(error))
+                }
+                (ReceiptState::Pending, None, None) => Err(ApiError::new(
                     axum::http::StatusCode::CONFLICT,
                     "idempotent request outcome is pending or ambiguous; query its receipt",
                 )),
@@ -147,6 +158,7 @@ impl IdempotencyStore {
                 request_hash: reservation.request_hash.clone(),
                 state: ReceiptState::Pending,
                 response: None,
+                response_status: None,
             },
         )
         .map_err(ApiError::internal)?;
@@ -178,6 +190,12 @@ impl IdempotencyStore {
                 "idempotency receipt response changed",
             ));
         }
+        if current.state == ReceiptState::Failed {
+            return Err(ApiError::new(
+                axum::http::StatusCode::CONFLICT,
+                "failed idempotency receipt cannot complete",
+            ));
+        }
         write_receipt(
             &path,
             &IdempotencyReceipt {
@@ -187,6 +205,57 @@ impl IdempotencyStore {
                 request_hash: reservation.request_hash,
                 state: ReceiptState::Completed,
                 response: Some(response),
+                response_status: Some(200),
+            },
+        )
+        .map_err(ApiError::internal)
+    }
+
+    pub fn fail(&self, reservation: Reservation, error: &ApiError) -> ApiResult<()> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| ApiError::internal(anyhow::anyhow!("idempotency lock poisoned")))?;
+        let path = receipt_path(&reservation.root, &reservation.key);
+        let current = read_receipt(&path).map_err(ApiError::internal)?;
+        if current.key != reservation.key
+            || current.scope != reservation.scope
+            || current.request_hash != reservation.request_hash
+        {
+            return Err(ApiError::new(
+                axum::http::StatusCode::CONFLICT,
+                "idempotency receipt binding changed",
+            ));
+        }
+        let response = serde_json::to_value(error)
+            .map_err(|error| ApiError::internal(anyhow::Error::new(error)))?;
+        if current.state == ReceiptState::Failed {
+            if current.response.as_ref() == Some(&response)
+                && current.response_status == Some(error.status)
+            {
+                return Ok(());
+            }
+            return Err(ApiError::new(
+                axum::http::StatusCode::CONFLICT,
+                "idempotency receipt failure changed",
+            ));
+        }
+        if current.state == ReceiptState::Completed {
+            return Err(ApiError::new(
+                axum::http::StatusCode::CONFLICT,
+                "completed idempotency receipt cannot fail",
+            ));
+        }
+        write_receipt(
+            &path,
+            &IdempotencyReceipt {
+                schema_version: RECEIPT_VERSION.to_string(),
+                key: reservation.key,
+                scope: reservation.scope,
+                request_hash: reservation.request_hash,
+                state: ReceiptState::Failed,
+                response: Some(response),
+                response_status: Some(error.status),
             },
         )
         .map_err(ApiError::internal)
@@ -236,8 +305,19 @@ pub fn replay_json<T: for<'de> Deserialize<'de>>(decision: &Decision) -> ApiResu
         Decision::Replay(value) => serde_json::from_value(value.clone())
             .map(Some)
             .map_err(|error| ApiError::internal(anyhow::Error::new(error))),
+        Decision::ReplayFailure(error) => Err(error.clone()),
         _ => Ok(None),
     }
+}
+
+/// Persist a known no-effect handler error so retries replay it exactly.
+pub fn fail_json(store: &IdempotencyStore, decision: Decision, error: ApiError) -> ApiError {
+    if let Decision::Fresh(reservation) = decision
+        && let Err(persist_error) = store.fail(reservation, &error)
+    {
+        return persist_error;
+    }
+    error
 }
 
 fn parse_key(headers: &HeaderMap) -> ApiResult<Option<String>> {
@@ -270,42 +350,59 @@ fn receipt_path(root: &Utf8Path, key: &str) -> Utf8PathBuf {
     root.join(format!("{}.json", blake3::hash(key.as_bytes()).to_hex()))
 }
 
+fn ensure_receipt_root(data_root: &Utf8Path) -> Result<()> {
+    let root = data_root.join("http-idempotency");
+    #[cfg(unix)]
+    let created = !root.exists();
+    fs::create_dir_all(root.as_std_path())
+        .with_context(|| format!("create idempotency receipt root {root}"))?;
+    #[cfg(unix)]
+    if created {
+        File::open(data_root.as_std_path())
+            .with_context(|| format!("open idempotency receipt parent {data_root}"))?
+            .sync_all()
+            .with_context(|| format!("sync idempotency receipt parent {data_root}"))?;
+    }
+    Ok(())
+}
+
 fn read_receipt(path: &Utf8Path) -> Result<IdempotencyReceipt> {
     let bytes = fs::read(path.as_std_path()).with_context(|| format!("read receipt {path}"))?;
     let receipt: IdempotencyReceipt =
         serde_json::from_slice(&bytes).with_context(|| format!("decode receipt {path}"))?;
-    if receipt.schema_version != RECEIPT_VERSION {
+    if receipt.schema_version != RECEIPT_VERSION && receipt.schema_version != LEGACY_RECEIPT_VERSION
+    {
         anyhow::bail!("unsupported receipt schema {}", receipt.schema_version);
     }
     Ok(receipt)
 }
 
 fn write_receipt(path: &Utf8Path, receipt: &IdempotencyReceipt) -> Result<()> {
-    let parent = path.parent().context("receipt path has no parent")?;
-    fs::create_dir_all(parent.as_std_path())?;
-    let temporary = parent.join(format!(".receipt-{}.tmp", uuid::Uuid::new_v4()));
-    let bytes = serde_json::to_vec(receipt)?;
-    let mut file = File::create(temporary.as_std_path())?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    fs::rename(temporary.as_std_path(), path.as_std_path())?;
-    File::open(parent.as_std_path())?.sync_all()?;
-    Ok(())
+    durable_json::write(path.as_std_path(), receipt)
 }
 
 #[cfg(test)]
 mod tests {
     use axum::http::{HeaderMap, HeaderValue};
 
-    use super::{Decision, IdempotencyStore, complete_json, replay_json, request_hash};
+    use super::{
+        Decision, IdempotencyStore, ReceiptState, complete_json, ensure_receipt_root, fail_json,
+        replay_json, request_hash,
+    };
+    use crate::ApiError;
+
+    fn request_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", HeaderValue::from_static("request-1"));
+        headers
+    }
 
     #[test]
     fn completed_receipt_replays_and_conflicting_request_is_rejected() {
         let temp = tempfile::tempdir().unwrap();
         let root = camino::Utf8Path::from_path(temp.path()).unwrap();
         let store = IdempotencyStore::default();
-        let mut headers = HeaderMap::new();
-        headers.insert("idempotency-key", HeaderValue::from_static("request-1"));
+        let headers = request_headers();
         let hash = request_hash("test", &serde_json::json!({"value": 1})).unwrap();
         let decision = store.begin(root, &headers, "test", hash.clone()).unwrap();
         assert!(matches!(decision, Decision::Fresh(_)));
@@ -317,6 +414,87 @@ mod tests {
             Some(serde_json::json!({"ok": true}))
         );
         let other = request_hash("test", &serde_json::json!({"value": 2})).unwrap();
-        assert!(store.begin(root, &headers, "test", other).is_err());
+        let error = store.begin(root, &headers, "test", other).unwrap_err();
+        assert_eq!(error.status, 409);
+    }
+
+    #[test]
+    fn pending_receipt_is_visible_to_a_new_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_root = camino::Utf8Path::from_path(temp.path()).unwrap();
+        let store = IdempotencyStore::default();
+        let headers = request_headers();
+        let request_hash = request_hash("test", &serde_json::json!({"value": 1})).unwrap();
+
+        let decision = store
+            .begin(data_root, &headers, "test", request_hash)
+            .unwrap();
+        assert!(matches!(decision, Decision::Fresh(_)));
+
+        let reopened = IdempotencyStore::default();
+        let receipt = reopened.lookup(data_root, "request-1").unwrap();
+        assert_eq!(receipt.state, ReceiptState::Pending);
+        assert_eq!(receipt.response, None);
+    }
+
+    #[test]
+    fn completed_receipt_is_visible_to_a_new_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_root = camino::Utf8Path::from_path(temp.path()).unwrap();
+        let store = IdempotencyStore::default();
+        let headers = request_headers();
+        let request_hash = request_hash("test", &serde_json::json!({"value": 1})).unwrap();
+        let expected_response = serde_json::json!({"ok": true});
+
+        let decision = store
+            .begin(data_root, &headers, "test", request_hash)
+            .unwrap();
+        complete_json(&store, decision, &expected_response).unwrap();
+
+        let reopened = IdempotencyStore::default();
+        assert_eq!(
+            reopened.lookup(data_root, "request-1").unwrap().state,
+            ReceiptState::Completed
+        );
+        assert_eq!(
+            reopened.lookup(data_root, "request-1").unwrap().response,
+            Some(expected_response)
+        );
+    }
+
+    #[test]
+    fn failed_receipt_replays_the_exact_no_effect_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = camino::Utf8Path::from_path(temp.path()).unwrap();
+        let store = IdempotencyStore::default();
+        let headers = request_headers();
+        let hash = request_hash("test", &serde_json::json!({"value": 1})).unwrap();
+        let decision = store.begin(root, &headers, "test", hash.clone()).unwrap();
+        let error = ApiError::new(axum::http::StatusCode::PRECONDITION_FAILED, "stale epoch");
+
+        let returned = fail_json(&store, decision, error);
+        assert_eq!(returned.status, 412);
+        let receipt = store.lookup(root, "request-1").unwrap();
+        assert_eq!(receipt.state, ReceiptState::Failed);
+        assert_eq!(receipt.response_status, Some(412));
+
+        let replay = store.begin(root, &headers, "test", hash).unwrap();
+        let replayed = replay_json::<serde_json::Value>(&replay).unwrap_err();
+        assert_eq!(replayed.status, 412);
+        assert_eq!(replayed.message, "stale epoch");
+    }
+
+    #[test]
+    fn receipt_root_creation_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_root = camino::Utf8Path::from_path(temp.path())
+            .unwrap()
+            .join("data");
+        std::fs::create_dir(data_root.as_std_path()).unwrap();
+
+        ensure_receipt_root(&data_root).unwrap();
+        assert!(data_root.join("http-idempotency").is_dir());
+
+        ensure_receipt_root(&data_root).unwrap();
     }
 }
