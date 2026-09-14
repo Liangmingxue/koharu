@@ -18,7 +18,6 @@ use crate::{binary, events};
 
 const MAX_BODY_SIZE: usize = 1024 * 1024 * 1024;
 
-/// State threaded through every `State<ApiState>` extractor.
 pub type ApiState = AppState;
 
 fn bootstrap_api() -> OpenApiRouter<ApiState> {
@@ -38,12 +37,12 @@ fn app_api() -> OpenApiRouter<ApiState> {
         .merge(routes::fonts::router())
         .merge(routes::llm::router())
         .merge(routes::ai::router())
+        .merge(routes::chart_agent::router())
         .merge(routes::pipelines::router())
         .merge(crate::idempotency::router())
         .merge(binary::router())
 }
 
-/// Build the router + OpenAPI doc. Called by the bin and by `router()`.
 pub fn api() -> (Router<ApiState>, utoipa::openapi::OpenApi) {
     bootstrap_api().merge(app_api()).split_for_parts()
 }
@@ -62,8 +61,6 @@ async fn require_ready(State(app): State<ApiState>, request: Request, next: Next
     next.run(request).await
 }
 
-/// Ready-to-serve router. `app` becomes shared state. All routes live under
-/// `/api/v1` so the UI can reach them through a single proxy prefix.
 pub fn router(app: ApiState) -> Router {
     let (bootstrap, _) = bootstrap_api().split_for_parts();
     let (guarded, _) = app_api().split_for_parts();
